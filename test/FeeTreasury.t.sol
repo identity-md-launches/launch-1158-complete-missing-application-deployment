@@ -244,17 +244,27 @@ contract FeeTreasuryTest is Fixture {
         assertEq(fresh.stakingVault(), address(vault));
         fresh.setPrio(address(token)); // PRIO too, before any purchase
         vm.stopPrank();
-        // The fixture treasury has bought: nothing can be redirected any more.
+        // The fixture treasury has bought PRIO: PRIO, the vault and the arena can no longer be redirected.
+        // The OracleAdapter sink is frozen by the first IMD purchase, not by a PRIO one (finding f3a579d3).
         earn(100 ether);
         treasury.allocate();
         vm.prank(executor);
         treasury.buyPrio(0.1 ether, 0);
         assertTrue(treasury.purchased());
+        assertTrue(treasury.prioPurchased());
+        assertFalse(treasury.imdPurchased());
         vm.startPrank(owner);
         vm.expectRevert(FeeTreasury.AlreadySet.selector);
-        treasury.setSinks(address(vault), address(arena), adapterAddr);
+        treasury.setSinks(address(arena), address(vault), adapterAddr);
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setSinks(address(vault), address(new Arena(owner, address(token))), adapterAddr);
         vm.expectRevert(FeeTreasury.AlreadySet.selector);
         treasury.setPrio(address(token));
+        address rightAdapter = makeAddr("rightAdapter");
+        treasury.setSinks(address(vault), address(arena), rightAdapter); // a typo in the adapter is still fixable
+        assertEq(treasury.oracleAdapter(), rightAdapter);
+        assertEq(treasury.stakingVault(), address(vault));
+        treasury.setSinks(address(vault), address(arena), adapterAddr);
         vm.stopPrank();
     }
 

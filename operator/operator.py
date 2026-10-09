@@ -10,11 +10,14 @@ Budget-limited driver for the IdentityMD paid flows the project uses:
                           is a *proposal file* for the owner to read. It never changes an active
                           round, never signs anything and never touches player funds.
   * ``buy-prio`` / ``buy-imd`` - the treasury's bounded purchases (``FeeTreasury.buyPrio`` /
-                          ``buyImd``). Every purchase is simulated first with ``cast call``; when the
-                          pool answers ``PriceLimitAlreadyExceeded`` (no liquidity left on the buy
-                          side) the operator records a backoff and refuses to broadcast until it has
-                          expired, instead of paying gas for a swap that cannot fill. The backoff
-                          doubles on every consecutive refusal and resets on the first success.
+                          ``buyImd``). Every purchase is simulated first with ``cast call`` and sent
+                          with ``minOut`` = the simulated fill less ``min_out_bps_of_quote`` (3% by
+                          default), so a sandwich cannot push the fill down to the owner's floor; when
+                          the pool answers ``NoFill`` / ``PriceLimitAlreadyExceeded`` (no liquidity
+                          left on the buy side) the operator records a backoff and refuses to
+                          broadcast until it has expired, instead of paying gas for a swap that cannot
+                          fill. The backoff doubles on every consecutive refusal and resets on the
+                          first success.
 
 Everything is capped by ``operator.json``: a spend ceiling per UTC day in IMD and in gas ETH, a
 maximum number of requests per day, and a hard switch ``paid_operations_enabled`` that stays off
@@ -65,7 +68,7 @@ DEFAULT_CONFIG = {
     "retries": {"attempts": 3, "backoff_seconds": 5},
     "purchases": {
         "eth_per_buy": "100000000000000000",
-        "min_out_bps_of_floor": 10000,
+        "min_out_bps_of_quote": 9700,
         "price_limit_backoff_seconds": 3600,
         "price_limit_backoff_max_seconds": 86400,
     },
@@ -161,6 +164,11 @@ def require_enabled(cfg: dict[str, Any]) -> None:
 # the direction of the swap at this price" case the brief names: back off, do not retry on a timer.
 PRICE_LIMIT_ALREADY_EXCEEDED = "PriceLimitAlreadyExceeded"
 PRICE_LIMIT_SELECTOR = "0x7c9c6e8f"  # bytes4(keccak256("PriceLimitAlreadyExceeded(uint160,uint160)"))
+# FeeTreasury's own "the pool filled nothing" revert: same meaning (no token to sell below the current
+# price), same handling. It is what the first call against an exhausted pool returns; the PoolManager's
+# PriceLimitAlreadyExceeded would only appear on a later call.
+NO_FILL = "NoFill"
+NO_FILL_SELECTOR = "0x87a41aac"  # bytes4(keccak256("NoFill()"))
 
 
 class Backoff:
@@ -198,17 +206,47 @@ class Backoff:
 
 
 def is_price_limit_revert(text: str) -> bool:
+    """True for the two "nothing to sell at this price" reverts (FeeTreasury NoFill, PoolManager price limit)."""
     t = text or ""
-    return PRICE_LIMIT_ALREADY_EXCEEDED in t or PRICE_LIMIT_SELECTOR in t.lower()
+    low = t.lower()
+    return (
+        PRICE_LIMIT_ALREADY_EXCEEDED in t
+        or PRICE_LIMIT_SELECTOR in low
+        or NO_FILL in t
+        or NO_FILL_SELECTOR in low
+    )
+
+
+def quoted_out(text: str) -> int:
+    """The uint256 ``cast call`` printed for a simulated buy (decimal, or 0x-hex for raw output); -1 if none."""
+    words = (text or "").split()
+    if not words:
+        return -1
+    word = words[-1]
+    try:
+        return int(word, 16) if word.lower().startswith("0x") else int(word)
+    except ValueError:
+        return -1
+
+
+def min_out_for(cfg: dict[str, Any], quoted: int) -> int:
+    """The ``minOut`` sent with a purchase: the simulated fill less the configured tolerance."""
+    bps = int(cfg["purchases"]["min_out_bps_of_quote"])
+    if not 0 < bps <= 10_000:
+        raise SystemExit("purchases.min_out_bps_of_quote must be in 1..10000")
+    return quoted * bps // 10_000
 
 
 def cmd_buy(cfg: dict[str, Any], budget: Budget, backoff: Backoff, kind: str, dry_run: bool, now=time.time, caller=None) -> dict:
     """``FeeTreasury.buyPrio`` / ``buyImd`` from the operator (executor) wallet, simulate-first.
 
     The contract itself bounds the spend (maxSpendPerSwap, spendPerWindow, price floors); this adds the
-    operator's daily gas ledger and the PriceLimitAlreadyExceeded backoff. Nothing is sent when the
-    simulation fails for any reason; only the price-limit case arms the backoff, because it means the pool
-    has no liquidity to sell into right now and retrying on a timer would only burn gas.
+    operator's daily gas ledger, the no-liquidity backoff and a per-purchase slippage bound: the
+    transaction is sent with ``minOut`` = the simulated fill x ``min_out_bps_of_quote`` / 10000, so a fill
+    worse than the quote by more than the tolerance reverts ``Slippage`` instead of being accepted down to
+    the owner's floor. Nothing is sent when the simulation fails for any reason or returns no fill; only the
+    no-liquidity case (``NoFill`` / ``PriceLimitAlreadyExceeded``) arms the backoff, because it means the
+    pool has nothing to sell right now and retrying on a timer would only burn gas.
     """
     require_enabled(cfg)
     treasury = cfg["contracts"].get("fee_treasury")
@@ -226,18 +264,25 @@ def cmd_buy(cfg: dict[str, Any], budget: Budget, backoff: Backoff, kind: str, dr
     executor = cfg.get("executor_address", "")
     sim_args = [treasury, fn, eth_in, "0"] + (["--from", executor] if executor else [])
     try:
-        run(sim_args, cfg, dry_run=dry_run)
+        quoted_text = run(sim_args, cfg, dry_run=dry_run)
     except subprocess.CalledProcessError as exc:
         text = (exc.stderr or "") + (exc.stdout or "")
         if is_price_limit_revert(text):
             wait = backoff.hit(kind, now())
-            return {"ok": False, "reason": f"{PRICE_LIMIT_ALREADY_EXCEEDED}: pool has no liquidity for this buy; backing off {wait}s", "backoff_seconds": wait}
+            return {"ok": False, "reason": f"{NO_FILL}/{PRICE_LIMIT_ALREADY_EXCEEDED}: pool has no liquidity for this buy; backing off {wait}s", "backoff_seconds": wait}
         return {"ok": False, "reason": "simulation reverted; nothing sent", "detail": text.strip()[-400:]}
-    tx = run([treasury, fn, eth_in, "0"], cfg, send=True, dry_run=dry_run)
+    if dry_run:
+        quoted = 0
+    else:
+        quoted = quoted_out(quoted_text)
+        if quoted <= 0:
+            return {"ok": False, "reason": "simulation returned no fill; nothing sent", "detail": str(quoted_text)[-200:]}
+    min_out = min_out_for(cfg, quoted)
+    tx = run([treasury, fn, eth_in, str(min_out)], cfg, send=True, dry_run=dry_run)
     if not dry_run:
         budget.record(gas_wei=int(4e15))
     backoff.clear(kind)
-    return {"ok": True, "tx": tx}
+    return {"ok": True, "tx": tx, "quoted_out": str(quoted), "min_out": str(min_out)}
 
 
 # ----------------------------------------------------------------------------- commands

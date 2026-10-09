@@ -46,15 +46,20 @@ interface IPrioSink {
 /// bucket expired and lasts `SPEND_WINDOW`, so the most that can leave in any 24-hour span is
 /// 2 x `spendPerWindow` (the end of one bucket and the start of the next). Size `spendPerWindow` with that
 /// bound in mind. A swap that fills only partly (thin liquidity) spends only what the pool took; the rest
-/// stays on its budget line, so every wei the contract holds is always on exactly one line. Purchased PRIO
+/// stays on its budget line, so every wei the contract holds is always on exactly one line. A swap that
+/// fills nothing (the pool has no token to sell below the current price) is not a purchase: it reverts
+/// `NoFill`, so it neither freezes a binding nor parks the pool at the price limit. Purchased PRIO
 /// is split equally between the StakingVault (reward stream) and the Arena (game pool). Purchased IMD goes
 /// to the OracleAdapter. PRIO purchases depend only on the hook's own pool; IMD purchases wait for an
 /// owner-set IMD pool key. The reserve pays operator gas (`withdrawReserve`): a fee-funded bootstrap, never
 /// an advance. The executor may draw it only to its own address and at most `reservePerWindow` per bucket.
 ///
-/// Bindings (`bindHook`, `setPrio`, `setSinks`) can be corrected by the owner until they have been used:
-/// the hook until the first fee arrives, PRIO and the sinks until the first purchase. From then on they are
-/// immutable, so the 30% PRIO and 30% IMD allocations can never be redirected once money has flowed.
+/// Bindings (`bindHook`, `setPrio`, `setSinks`, `setImd`) can be corrected by the owner until they have been
+/// used: the hook until the first fee arrives, PRIO and the two PRIO sinks until the first PRIO purchase,
+/// the IMD token and the OracleAdapter sink until the first IMD purchase. From then on they are immutable,
+/// so neither the 30% PRIO nor the 30% IMD allocation can be redirected once money has flowed on that line.
+/// Only the venue of IMD purchases (`setImdPool`, a pool key for the frozen IMD token) stays movable, because
+/// liquidity migrates between pools; every fill is still bounded by the owner's `minImdPerEth` floor.
 contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
@@ -88,8 +93,10 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     uint256 public reservePerWindow = 0.05 ether;
     uint256 public reserveWindowStart;
     uint256 public reserveSpentInWindow;
-    /// @notice True once a purchase has succeeded: PRIO and the sinks are frozen from then on.
-    bool public purchased;
+    /// @notice True once a PRIO purchase has filled: PRIO, the vault and the arena are frozen from then on.
+    bool public prioPurchased;
+    /// @notice True once an IMD purchase has filled: the IMD token and the OracleAdapter sink are frozen.
+    bool public imdPurchased;
     /// @notice Price floors, token units (18 decimals) per 1 ETH spent. Zero means not configured: refused.
     uint256 public minPrioPerEth;
     uint256 public minImdPerEth;
@@ -137,6 +144,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     error TransferFailed();
     error SinkMismatch();
     error WrongDestination();
+    error NoFill();
 
     constructor(IPoolManager poolManager_, address owner_) TwoStepOwned(owner_) {
         if (address(poolManager_) == address(0)) revert ZeroAddress();
@@ -163,16 +171,18 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         emit HookBound(hook_);
     }
 
-    /// @notice The PRIO token purchases buy. Correctable until the first purchase; immutable afterwards.
+    /// @notice The PRIO token purchases buy. Correctable until the first PRIO purchase; immutable afterwards.
     function setPrio(address prio_) external onlyOwner {
-        if (purchased) revert AlreadySet();
+        if (prioPurchased) revert AlreadySet();
         if (prio_ == address(0)) revert ZeroAddress();
         prio = IERC20(prio_);
         emit PrioSet(prio_);
     }
 
-    /// @notice Changing the IMD token unsets the IMD pool: `setImdPool` must be called again for the new token.
+    /// @notice The IMD token purchases buy. Correctable until the first IMD purchase; immutable afterwards.
+    /// Changing it unsets the IMD pool: `setImdPool` must be called again for the new token.
     function setImd(address imd_) external onlyOwner {
+        if (imdPurchased) revert AlreadySet();
         if (imd_ == address(0)) revert ZeroAddress();
         imd = IERC20(imd_);
         imdPoolSet = false;
@@ -181,10 +191,12 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     }
 
     /// @notice Where purchases go. The vault and the arena must report the configured PRIO as their token (a
-    /// swapped or foreign sink is refused). Correctable until the first purchase; from then on the 30% PRIO
-    /// and 30% IMD allocations cannot be redirected.
+    /// swapped or foreign sink is refused). The vault and the arena are correctable until the first PRIO
+    /// purchase, the OracleAdapter until the first IMD purchase; from then on that line cannot be redirected
+    /// (passing the frozen address again is allowed, so the other line can still be corrected).
     function setSinks(address stakingVault_, address arena_, address oracleAdapter_) external onlyOwner {
-        if (purchased) revert AlreadySet();
+        if (prioPurchased && (stakingVault_ != stakingVault || arena_ != arena)) revert AlreadySet();
+        if (imdPurchased && oracleAdapter_ != oracleAdapter) revert AlreadySet();
         if (stakingVault_ == address(0) || arena_ == address(0) || oracleAdapter_ == address(0)) revert ZeroAddress();
         if (address(prio) == address(0)) revert NotConfigured("prio");
         if (IPrioSink(stakingVault_).prio() != address(prio) || IPrioSink(arena_).prio() != address(prio)) {
@@ -247,6 +259,11 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
 
     function imdPoolKey() external view returns (PoolKey memory) {
         return _imdPoolKey;
+    }
+
+    /// @notice True once any purchase has filled (either line).
+    function purchased() external view returns (bool) {
+        return prioPurchased || imdPurchased;
     }
 
     // ------------------------------------------------------------------ allocation (permissionless)
@@ -312,7 +329,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         uint256 spent;
         (out, spent) = _swapEthFor(IFeeHook(hook).poolKey(), ethIn, minPrioOut, minPrioPerEth);
         prioBudget += ethIn - spent;
-        purchased = true;
+        prioPurchased = true;
         uint256 toStaking = out / 2;
         uint256 toArena = out - toStaking;
         prio.forceApprove(stakingVault, toStaking);
@@ -334,7 +351,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         uint256 spent;
         (out, spent) = _swapEthFor(_imdPoolKey, ethIn, minImdOut, minImdPerEth);
         imdBudget += ethIn - spent;
-        purchased = true;
+        imdPurchased = true;
         imd.safeTransfer(oracleAdapter, out);
         emit ImdBought(spent, out);
     }
@@ -342,7 +359,11 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     // ------------------------------------------------------------------ swap plumbing
 
     /// @dev Bounds the spend per call and per `SPEND_WINDOW` bucket on what was actually spent, and checks both
-    /// the executor's `minOut` and the owner's price floor (scaled to the ETH actually spent).
+    /// the executor's `minOut` and the owner's price floor (scaled to the ETH actually spent). A swap the pool
+    /// cannot fill at all (no token to sell below the current price: the PoolManager walks to the price limit
+    /// and returns a zero delta instead of reverting) is refused as `NoFill`, so it is never recorded as a
+    /// purchase; the next call then reverts `PriceLimitAlreadyExceeded` in the PoolManager until liquidity
+    /// returns, which the operator treats as a signal to back off.
     function _swapEthFor(PoolKey memory key, uint256 ethIn, uint256 minOut, uint256 floorPerEth)
         internal
         returns (uint256 out, uint256 spent)
@@ -355,6 +376,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         if (spentInWindow + ethIn > spendPerWindow) revert ExceedsWindow();
         bytes memory result = poolManager.unlock(abi.encode(key, ethIn));
         (out, spent) = abi.decode(result, (uint256, uint256));
+        if (spent == 0 || out == 0) revert NoFill();
         spentInWindow += spent;
         if (out < minOut || out < (spent * floorPerEth) / ONE) revert Slippage();
     }

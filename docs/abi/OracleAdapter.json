@@ -973,6 +973,25 @@
   },
   {
     "type": "function",
+    "name": "wasAsset",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "windowStart",
     "inputs": [],
     "outputs": [
@@ -1296,6 +1315,11 @@
   },
   {
     "type": "error",
+    "name": "ArenaAlreadySet",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "AssetNotWithdrawable",
     "inputs": []
   },
@@ -1460,6 +1484,17 @@
   {
     "type": "error",
     "name": "RequestPending",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "RoundNotCreated",
     "inputs": [
       {
         "name": "roundId",

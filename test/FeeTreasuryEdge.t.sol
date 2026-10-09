@@ -399,12 +399,65 @@ contract FeeTreasuryEdgeTest is Fixture {
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(FeeTreasury.NotConfigured.selector, "imd price floor"));
         fresh.buyImd(0.1 ether, 0);
-        // Changing the IMD token after the pool was set drops the pool: the next buy must wait for a new key.
-        vm.prank(owner);
+        // After the first IMD purchase the IMD token and the adapter sink are frozen (finding d6110259);
+        // the vault and the arena are not, since no PRIO was bought here; the venue stays movable.
+        assertTrue(treasury.imdPurchased());
+        assertFalse(treasury.prioPurchased());
+        vm.startPrank(owner);
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
         treasury.setImd(address(token));
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setSinks(address(vault), address(arena), makeAddr("otherAdapter"));
+        treasury.setSinks(address(arena), address(vault), adapterAddr); // PRIO sinks still correctable
+        treasury.setSinks(address(vault), address(arena), adapterAddr);
+        treasury.setImdPool(3000, 60, address(0));
+        vm.stopPrank();
+        // Changing the IMD token after the pool was set drops the pool: the next buy must wait for a new key.
+        vm.startPrank(owner);
+        fresh.setImd(address(token));
+        vm.stopPrank();
+        assertFalse(fresh.imdPoolSet());
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(FeeTreasury.NotConfigured.selector, "imd pool"));
+        fresh.buyImd(0.1 ether, 0);
+    }
+
+    /// @dev Finding 95221d55: a swap against a pool with nothing to sell below the current price fills
+    /// nothing (spent 0, out 0) without reverting in the PoolManager, and used to count as a purchase: it
+    /// froze PRIO and the sinks, emitted `ImdBought(0, 0)` and parked the pool at the price limit. A zero
+    /// fill now reverts `NoFill` and changes nothing.
+    function test_zeroFillIsNotAPurchase() public {
+        setUpImdPool(); // deploys `imd` and a 3000/60 pool with liquidity, not used here
+        PoolKey memory emptyKey = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(address(imd)),
+            fee: 10_000,
+            tickSpacing: 200,
+            hooks: IHooks(address(0))
+        });
+        manager.initialize(emptyKey, SQRT_PRICE_1_1); // initialized, no liquidity at all
+        vm.startPrank(owner);
+        treasury.setImd(address(imd));
+        treasury.setImdPool(10_000, 200, address(0));
+        vm.stopPrank();
+        earn(100 ether);
+        treasury.allocate();
+        uint256 budget = treasury.imdBudget();
+        uint256 window = treasury.spentInWindow();
+        vm.prank(executor);
+        vm.expectRevert(FeeTreasury.NoFill.selector);
         treasury.buyImd(0.1 ether, 0);
+        assertFalse(treasury.purchased(), "a zero fill must not freeze PRIO and the sinks");
+        assertEq(treasury.imdBudget(), budget);
+        assertEq(treasury.spentInWindow(), window);
+        assertEq(imd.balanceOf(adapterAddr), 0);
+        bucketsEqualBalance();
+        // The pool was not parked at the limit: the same call on the pool with liquidity fills normally.
+        vm.prank(owner);
+        treasury.setImdPool(3000, 60, address(0));
+        vm.prank(executor);
+        assertGt(treasury.buyImd(0.1 ether, 1), 0);
+        assertTrue(treasury.imdPurchased());
     }
 
     // ------------------------------------------------------------------ guards and ownership

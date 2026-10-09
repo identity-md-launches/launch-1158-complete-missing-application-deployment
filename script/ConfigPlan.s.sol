@@ -92,7 +92,11 @@ contract ConfigPlan is Script {
             "A5 StakingVault.setRewardFunder", a.vault, abi.encodeCall(StakingVault.setRewardFunder, (a.treasury))
         );
         steps[i++] = Step("A6 Arena.setOracle", a.arena, abi.encodeCall(Arena.setOracle, (IRoundOracle(a.adapter))));
-        steps[i++] = Step("A7 OracleAdapter.setArena", a.adapter, abi.encodeCall(OracleAdapter.setArena, (a.arena)));
+        steps[i++] = Step(
+            "A7 OracleAdapter.setArena (one-shot: verify the Arena address first)",
+            a.adapter,
+            abi.encodeCall(OracleAdapter.setArena, (a.arena))
+        );
         // Phase B: operating limits and paid-operation configuration.
         steps[i++] = Step(
             "B1 FeeTreasury.setReserveTarget",

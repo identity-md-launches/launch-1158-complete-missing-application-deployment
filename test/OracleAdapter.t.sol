@@ -355,15 +355,129 @@ contract OracleAdapterTest is Test {
         stub.set(1);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 1));
         adapter.pinQuestion(1, QUESTION, 1, 5, 4, ISSUED_AT + 2 days, "");
-        // A settled round or an open request also freezes the pin.
+        // A round the Arena has not created takes no paid request (finding 615b6c64); once created, an open
+        // request freezes the pin too.
         adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
         vm.stopPrank();
         configurePaid();
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, 2));
+        adapter.request(2);
+        stub.set(2);
         vm.prank(executor);
         adapter.request(2);
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 2));
         adapter.pinQuestion(2, keccak256("x"), 1, 5, 4, ISSUED_AT - 1 hours, "");
+    }
+
+    /// @dev Finding 04dbc34c: re-pointing `setArena` at a contract reporting fewer rounds made the pin of an
+    /// open round replaceable. The Arena is one-shot.
+    function test_setArenaIsOneShot() public {
+        ArenaStub stub = new ArenaStub();
+        ArenaStub empty = new ArenaStub();
+        vm.startPrank(owner);
+        vm.expectRevert(OracleAdapter.ZeroAddress.selector);
+        adapter.setArena(address(0));
+        adapter.setArena(address(stub));
+        stub.set(1);
+        vm.expectRevert(OracleAdapter.ArenaAlreadySet.selector);
+        adapter.setArena(address(empty));
+        vm.expectRevert(OracleAdapter.ArenaAlreadySet.selector);
+        adapter.setArena(address(stub));
+        assertEq(adapter.arena(), address(stub));
+        // The pin consumed by round 1 stays what it was, whatever the owner tries.
+        adapter.setSigner(makeAddr("rogue"));
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 1));
+        adapter.pinQuestion(1, keccak256("rogue"), 1, 5, 4, ISSUED_AT - 1 hours, "");
+        vm.stopPrank();
+        assertEq(adapter.pinned(1).questionHash, QUESTION);
+        assertEq(adapter.pinned(1).signer, SIGNER);
+    }
+
+    /// @dev Finding 615b6c64: a result stored for a pinned round the Arena had not created could never be
+    /// undone and made that id (and every later one) impossible to create. With an Arena configured, neither
+    /// a relay nor the Intake callback stores a result for an uncreated round, and the pin stays replaceable.
+    function test_noResultForARoundTheArenaHasNotCreated_pinStaysReplaceable() public {
+        ArenaStub stub = new ArenaStub();
+        vm.startPrank(owner);
+        adapter.setArena(address(stub));
+        adapter.setExecutor(executor);
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT + 1 hours, "");
+        vm.stopPrank();
+        vm.warp(ISSUED_AT + 1 hours); // the commit deadline lapses before the round is created
+        OracleAttestation.Attestation memory a = roundAnswer(9);
+        a.issuedAt = uint64(block.timestamp);
+        a.expiresAt = uint64(block.timestamp + 1 hours);
+        bytes memory sig = sign(a);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, 2));
+        adapter.submitAttestation(2, a, sig);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, 2));
+        adapter.submitAttestation(2, a, sig);
+        assertFalse(adapter.resultOf(2).settled);
+        assertFalse(adapter.consumed(a.requestId), "a refused attestation is not consumed");
+        // The owner re-pins for a new commit deadline; once the Arena has created the round the same
+        // attestation (if still valid) settles it.
+        vm.prank(owner);
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, uint64(block.timestamp + 1 hours), "");
+        assertEq(adapter.pinned(2).notBefore, uint64(block.timestamp + 1 hours));
+        stub.set(2);
+        vm.warp(block.timestamp + 1 hours);
+        a.issuedAt = uint64(block.timestamp);
+        a.expiresAt = uint64(block.timestamp + 1 hours);
+        sig = sign(a);
+        vm.prank(owner);
+        adapter.submitAttestation(2, a, sig);
+        assertEq(adapter.resultOf(2).answer, 9);
+        // Round 1 (created, roundCount >= 1) is unaffected: the fixture's past-boundary pin still accepts.
+        stub.set(2);
+        OracleAttestation.Attestation memory b = roundAnswer(4);
+        b.issuedAt = uint64(block.timestamp);
+        b.expiresAt = uint64(block.timestamp + 1 hours);
+        bytes memory sigB = sign(b);
+        vm.prank(owner);
+        adapter.submitAttestation(1, b, sigB);
+        assertEq(adapter.resultOf(1).answer, 4);
+    }
+
+    /// @dev Finding 615b6c64, Intake side: the callback for a round the Arena has not created reverts, so
+    /// the request stays pending (and can be answered once the round exists, or cleared as stale).
+    function test_intakeCallbackForAnUncreatedRoundIsRefused() public {
+        ArenaStub stub = new ArenaStub();
+        configurePaid();
+        vm.startPrank(owner);
+        adapter.setArena(address(stub));
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        vm.stopPrank();
+        stub.set(2);
+        vm.prank(executor);
+        bytes32 id = adapter.request(2);
+        stub.set(1); // a stub only: a real Arena's roundCount never decreases
+        OracleAttestation.Attestation memory a = roundAnswer(3);
+        assertFalse(intake.deliver(abi.encode(id, a, sign(a))), "callback refused for an uncreated round");
+        assertEq(adapter.openRequest(2), id, "the request is still pending");
+        stub.set(2);
+        assertTrue(intake.deliver(abi.encode(id, a, sign(a))));
+        assertEq(adapter.resultOf(2).answer, 3);
+    }
+
+    /// @dev Finding 02cf1770: rotating `asset` with `setPayment` made the IMD bought for agent work
+    /// withdrawable. Every token ever configured as the asset is refused by `withdrawToken`.
+    function test_withdrawTokenRefusesEveryFormerAsset() public {
+        configurePaid();
+        PrismRiotToken other = new PrismRiotToken();
+        vm.startPrank(owner);
+        adapter.setPayment(address(other), 1);
+        assertTrue(adapter.wasAsset(address(imd)));
+        vm.expectRevert(OracleAdapter.AssetNotWithdrawable.selector);
+        adapter.withdrawToken(address(imd), owner, 1 ether);
+        adapter.setPayment(address(imd), 0.5 ether);
+        vm.expectRevert(OracleAdapter.AssetNotWithdrawable.selector);
+        adapter.withdrawToken(address(other), owner, 0);
+        vm.stopPrank();
+        assertEq(imd.balanceOf(address(adapter)), 5 ether, "the IMD bought for agent work stays");
     }
 
     // ------------------------------------------------------------------ the commit boundary

@@ -51,7 +51,11 @@ interface IIntake {
 /// pinned the round's question, set an executor, set a budget, and the contract holds IMD bought by the
 /// treasury from earned fees. A pin is immutable once the Arena has created its round; before that (and
 /// only when the owner has told this adapter which Arena to check with `setArena`) a mistaken pin can be
-/// replaced, so a wrong `notBefore` cannot block round creation forever.
+/// replaced, so a wrong `notBefore` cannot block round creation forever. `setArena` is one-shot: the Arena
+/// whose `roundCount` decides which pins are consumed can never be swapped for one that reports fewer
+/// rounds. While an Arena is set, no result is stored and no paid request is made for a round id that
+/// Arena has not created yet, so a lapsed pin stays replaceable and a stored answer always belongs to a
+/// real round.
 contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     using SafeERC20 for IERC20;
 
@@ -91,8 +95,10 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     uint256 public budgetPerWindow;
     uint256 public windowStart;
     uint256 public spentInWindow;
-    /// @notice The Arena whose `roundCount` tells which pins are already consumed (re-pin guard).
+    /// @notice The Arena whose `roundCount` tells which pins are already consumed (re-pin guard). One-shot.
     address public arena;
+    /// @notice Every token ever configured as the payment asset: none of them can leave through `withdrawToken`.
+    mapping(address token => bool) public wasAsset;
 
     mapping(uint256 roundId => Pinned) internal _pinned;
     mapping(uint256 roundId => Result) internal _results;
@@ -133,6 +139,8 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     error AssetNotWithdrawable();
     error RequestPending(uint256 roundId);
     error NotRelayer();
+    error ArenaAlreadySet();
+    error RoundNotCreated(uint256 roundId);
 
     constructor(address owner_, address signer_) OracleAttestationConsumer(signer_) TwoStepOwned(owner_) {}
 
@@ -149,11 +157,13 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         emit ActionSet(to);
     }
 
-    /// @notice Asset and price move together; the asset is the chain's IMD.
+    /// @notice Asset and price move together; the asset is the chain's IMD. A token named here is remembered
+    /// for ever as an asset (`wasAsset`), so renaming the asset never makes the old one withdrawable.
     function setPayment(address asset_, uint256 price_) external onlyOwner {
         if (asset_ == address(0)) revert ZeroAddress();
         asset = asset_;
         price = price_;
+        wasAsset[asset_] = true;
         emit PaymentSet(asset_, price_);
     }
 
@@ -169,8 +179,11 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     }
 
     /// @notice The Arena this adapter serves, so a pin for a round it has not created yet can be corrected.
+    /// One-shot: once set it can never point elsewhere, so the pin of a round the Arena has created cannot be
+    /// made replaceable again by naming a contract that reports fewer rounds.
     function setArena(address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (arena != address(0)) revert ArenaAlreadySet();
         arena = to;
         emit ArenaSet(to);
     }
@@ -213,6 +226,13 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         return IArenaRounds(arena).roundCount() < roundId;
     }
 
+    /// @dev While an Arena is configured, a round id it has not created yet takes neither a result nor a paid
+    /// request: a result for an uncreated round could never be undone and would make the id (and, since ids are
+    /// sequential, every later round) impossible to create.
+    function _requireCreated(uint256 roundId) internal view {
+        if (arena != address(0) && IArenaRounds(arena).roundCount() < roundId) revert RoundNotCreated(roundId);
+    }
+
     // ------------------------------------------------------------------ views
 
     function pinned(uint256 roundId) external view returns (Pinned memory) {
@@ -239,6 +259,7 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         if (p.questionHash == bytes32(0)) revert QuestionNotPinned(roundId);
         if (_results[roundId].settled) revert AlreadySettled(roundId);
         if (openRequest[roundId] != bytes32(0)) revert RequestPending(roundId);
+        _requireCreated(roundId);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.notBefore) revert BeforeBoundary(p.notBefore);
         if (block.timestamp >= windowStart + BUDGET_WINDOW) {
@@ -303,6 +324,7 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         Pinned storage p = _pinned[roundId];
         if (p.questionHash == bytes32(0)) revert QuestionNotPinned(roundId);
         if (_results[roundId].settled) revert AlreadySettled(roundId);
+        _requireCreated(roundId);
         // The chain's own clock: no answer is on chain while the Arena still accepts commitments.
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.notBefore) revert BeforeBoundary(p.notBefore);
@@ -342,10 +364,11 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         if (!SignatureChecker.isValidSignatureNow(signer, attestationDigest(a), signature)) revert BadSignature();
     }
 
-    /// @notice Returns a token sent here by mistake. The configured payment asset (the IMD bought from fees
-    /// for agent work) cannot be withdrawn: it is spent only on panel answers.
+    /// @notice Returns a token sent here by mistake. The payment asset, and every token that has ever been the
+    /// payment asset (the IMD bought from fees for agent work), cannot be withdrawn: it is spent only on panel
+    /// answers, and renaming the asset with `setPayment` does not release it.
     function withdrawToken(address token, address to, uint256 amount) external onlyOwner {
-        if (token == asset) revert AssetNotWithdrawable();
+        if (token == asset || wasAsset[token]) revert AssetNotWithdrawable();
         IERC20(token).safeTransfer(to, amount);
     }
 }

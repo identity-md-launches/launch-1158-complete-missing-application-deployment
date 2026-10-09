@@ -1,5 +1,14 @@
 """Offline tests for the operator: budgets, the disabled switch, retries and the polling loop."""
 
+import os
+import sys
+
+# `python3 operator/test_operator.py` puts this directory first on the module path, where operator.py would
+# shadow the standard library's `operator` module (which argparse/re import). Drop it; the module under
+# test is loaded below by file path.
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
+
 import io
 import json
 import tempfile
@@ -8,7 +17,6 @@ from pathlib import Path
 from unittest import mock
 
 import importlib.util
-import sys
 
 spec = importlib.util.spec_from_file_location("prio_operator", Path(__file__).with_name("operator.py"))
 op = importlib.util.module_from_spec(spec)
@@ -37,15 +45,44 @@ class PurchaseBackoffTests(unittest.TestCase):
         self.backoff = op.Backoff(self.cfg, Path(self.tmp.name) / "backoff.json")
         self.sent = []
 
-    def caller(self, revert_text=None):
+    def caller(self, revert_text=None, quote="1000000"):
         def run(args, cfg, send=False, dry_run=False):
             if send:
                 self.sent.append(args)
                 return "0xtx"
             if revert_text is not None:
                 raise op.subprocess.CalledProcessError(1, ["cast"], output="", stderr=revert_text)
-            return "0x"
+            return quote
         return run
+
+    def test_no_fill_revert_arms_backoff_like_the_price_limit(self):
+        now = 1_000_000
+        text = 'Error: server returned an error response: execution reverted, data: "0x87a41aac" NoFill()'
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "imd", False, now=lambda: now, caller=self.caller(text))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["backoff_seconds"], 3600)
+        self.assertEqual(self.sent, [])
+
+    def test_min_out_is_taken_from_the_simulated_fill(self):
+        now = 1_000_000
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(quote="1000000"))
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.sent[-1][3], "970000", "minOut = quote x 9700 / 10000, never 0")
+        self.assertEqual(out["min_out"], "970000")
+        # Raw hex output is understood too; a simulation without a decodable fill sends nothing.
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(quote="0x" + "f4240".rjust(64, "0")))
+        self.assertEqual(self.sent[-1][3], "970000")
+        before = len(self.sent)
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(quote="0x"))
+        self.assertFalse(out["ok"])
+        self.assertIn("no fill", out["reason"])
+        self.assertEqual(len(self.sent), before)
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(quote="0"))
+        self.assertFalse(out["ok"])
+        self.assertEqual(len(self.sent), before)
+        self.cfg["purchases"]["min_out_bps_of_quote"] = 0
+        with self.assertRaises(SystemExit):
+            op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller())
 
     def test_price_limit_revert_arms_backoff_and_doubles(self):
         now = 1_000_000

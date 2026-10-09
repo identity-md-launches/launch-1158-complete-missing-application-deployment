@@ -106,6 +106,9 @@ contract Arena is TwoStepOwned, ReentrancyGuard {
     uint256 public constant MISSED_REVEAL_RETURN = 80 ether;
     uint256 public constant MAX_LOSS = ENTRY_FEE + (ESCROW - MISSED_REVEAL_RETURN);
     uint256 public constant CANCEL_GRACE = 72 hours;
+    /// @notice Longest a round may run from its commit deadline to its result deadline, so escrow always has
+    /// a reachable cancel path (`resultDeadline + CANCEL_GRACE`) if no result ever arrives.
+    uint256 public constant MAX_ROUND_LENGTH = 30 days;
 
     IERC20 public immutable prio;
     IRoundOracle public oracle;
@@ -154,6 +157,7 @@ contract Arena is TwoStepOwned, ReentrancyGuard {
     error NotSettled();
     error NotCancelled();
     error AlreadyClaimed();
+    error QuestionChanged();
 
     constructor(address owner_, address prio_) TwoStepOwned(owner_) {
         if (prio_ == address(0)) revert ZeroAddress();
@@ -189,6 +193,7 @@ contract Arena is TwoStepOwned, ReentrancyGuard {
         if (!(block.timestamp < commitDeadline && commitDeadline < revealDeadline && revealDeadline < resultDeadline)) {
             revert BadDeadlines();
         }
+        if (uint256(resultDeadline) - commitDeadline > MAX_ROUND_LENGTH) revert BadDeadlines();
         if (prize > unallocatedPrizePool) revert PrizeNotFunded();
         roundId = roundCount + 1;
         IRoundOracle.Pinned memory p = oracle.pinned(roundId);
@@ -278,10 +283,12 @@ contract Arena is TwoStepOwned, ReentrancyGuard {
 
     // ------------------------------------------------------------------ settlement (permissionless)
 
-    /// @notice A valid result is on file for the round at the oracle it was created with.
+    /// @notice A valid result is on file for the round at the oracle it was created with, and the question
+    /// pinned there is still the one the round was created against.
     function resolved(uint256 roundId) public view returns (bool) {
         Round storage r = _rounds[roundId];
         if (r.state == RoundState.None) return false;
+        if (r.oracle.pinned(roundId).questionHash != r.questionHash) return false;
         IRoundOracle.Result memory res = r.oracle.resultOf(roundId);
         // The same clock tolerance the adapter uses: the answer may not predate the commit boundary.
         return res.settled && uint256(res.issuedAt) + r.oracle.ISSUED_AT_TOLERANCE() >= r.commitDeadline;
@@ -289,11 +296,14 @@ contract Arena is TwoStepOwned, ReentrancyGuard {
 
     /// @notice Settles with the verified result from the round's own oracle. Fails without one; never loops
     /// over players. There is no upper time bound: a resolved round settles, and only an unresolved one can
-    /// be cancelled, so the two outcomes never compete.
+    /// be cancelled, so the two outcomes never compete. The Arena checks for itself that the adapter still
+    /// pins the question the round was created against: a result for any other question never settles it,
+    /// whatever the adapter's configuration became.
     function settle(uint256 roundId) external nonReentrant {
         Round storage r = _rounds[roundId];
         if (r.state != RoundState.Open) revert NotOpen();
         if (block.timestamp < r.revealDeadline) revert RevealNotOver();
+        if (r.oracle.pinned(roundId).questionHash != r.questionHash) revert QuestionChanged();
         IRoundOracle.Result memory res = r.oracle.resultOf(roundId);
         if (!res.settled) revert NoResult();
         if (uint256(res.issuedAt) + r.oracle.ISSUED_AT_TOLERANCE() < r.commitDeadline) revert ResultTooEarly();

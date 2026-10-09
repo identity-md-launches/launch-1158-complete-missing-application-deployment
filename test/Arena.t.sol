@@ -449,6 +449,95 @@ contract ArenaTest is Test {
         arena.settle(id);
         assertEq(arena.payoutOf(id, alice), 102 ether);
     }
+
+    /// @dev Finding 064e2296: nothing capped `resultDeadline`, so escrow could sit in a round with no reachable
+    /// cancel path. A round runs at most `MAX_ROUND_LENGTH` from its commit deadline to its result deadline.
+    function test_roundLengthIsCapped() public {
+        uint64 commitDeadline = uint64(block.timestamp + 1 hours);
+        uint64 max = commitDeadline + uint64(arena.MAX_ROUND_LENGTH());
+        vm.startPrank(owner);
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, commitDeadline, "");
+        vm.expectRevert(Arena.BadDeadlines.selector);
+        arena.createRound(Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1 hours, max + 1, 0, 0, 0);
+        vm.expectRevert(Arena.BadDeadlines.selector);
+        arena.createRound(
+            Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1 hours, type(uint64).max - 1 days, 0, 0, 0
+        );
+        uint256 id = arena.createRound(Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1 hours, max, 0, 0, 0);
+        vm.stopPrank();
+        enter(id, alice, 1);
+        // The cancel path is always reachable: 30 days + 72 hours after the commit deadline at the latest.
+        vm.warp(uint256(max) + arena.CANCEL_GRACE());
+        arena.cancel(id);
+        assertEq(arena.payoutOf(id, alice), 102 ether);
+    }
+
+    /// @dev Finding 04dbc34c (Arena side): the Arena checks for itself that the adapter still pins the question
+    /// the round was created against. A result for any other question never settles the round; it is
+    /// cancelled and refunded instead.
+    function test_settleRefusesARoundWhosePinnedQuestionChanged() public {
+        MutableOracle fake = new MutableOracle();
+        vm.prank(owner);
+        arena.setOracle(IRoundOracle(address(fake)));
+        uint64 commitDeadline = uint64(block.timestamp + 1 hours);
+        fake.pin(QUESTION, commitDeadline);
+        vm.prank(owner);
+        uint256 id = arena.createRound(
+            Arena.Mode.FactionDuel,
+            2,
+            commitDeadline,
+            commitDeadline + 1 hours,
+            commitDeadline + 2 hours,
+            300 ether,
+            0,
+            0
+        );
+        enter(id, alice, 2);
+        skip(1 hours);
+        reveal(id, alice, 2);
+        skip(1 hours);
+        fake.pin(keccak256("rogue question"), commitDeadline);
+        fake.answer(0, commitDeadline); // winning = 1: Alice would lose
+        assertFalse(arena.resolved(id), "a result for another question does not resolve the round");
+        vm.expectRevert(Arena.QuestionChanged.selector);
+        arena.settle(id);
+        // Restored, the real result settles it as created.
+        fake.pin(QUESTION, commitDeadline);
+        fake.answer(1, commitDeadline); // winning = 2
+        assertTrue(arena.resolved(id));
+        arena.settle(id);
+        assertEq(arena.payoutOf(id, alice), 400 ether);
+        balanceInvariant();
+    }
+}
+
+/// @dev An oracle whose pin and result the test controls: what a misconfigured or rogue adapter looks like.
+contract MutableOracle is IRoundOracle {
+    Pinned internal _p;
+    Result internal _r;
+
+    function pin(bytes32 questionHash, uint64 notBefore) external {
+        _p.questionHash = questionHash;
+        _p.notBefore = notBefore;
+    }
+
+    function answer(uint256 value, uint64 issuedAt) external {
+        _r.answer = value;
+        _r.issuedAt = issuedAt;
+        _r.settled = true;
+    }
+
+    function resultOf(uint256) external view returns (Result memory) {
+        return _r;
+    }
+
+    function pinned(uint256) external view returns (Pinned memory) {
+        return _p;
+    }
+
+    function ISSUED_AT_TOLERANCE() external pure returns (uint64) {
+        return 5 minutes;
+    }
 }
 
 /// @dev An oracle that answers nothing: what a swapped-in result source looks like to an open round.

@@ -19,7 +19,7 @@
   "executor_address": "",
   "purchases": {
     "eth_per_buy": "100000000000000000",
-    "min_out_bps_of_floor": 10000,
+    "min_out_bps_of_quote": 9700,
     "price_limit_backoff_seconds": 3600,
     "price_limit_backoff_max_seconds": 86400
   }
