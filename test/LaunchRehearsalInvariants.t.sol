@@ -58,6 +58,7 @@ contract SystemHandler is Test {
     uint256 public ghostRequests;
     uint256 public ghostSwaps;
     uint256 public nextRound = 1;
+    uint256[] public openRounds;
 
     constructor(
         PrismRiotToken p,
@@ -290,19 +291,39 @@ contract SystemHandler is Test {
         ghostRewardsClaimed += prio.balanceOf(u) - before;
     }
 
-    // ------------------------------------------------------------------ oracle
+    // ------------------------------------------------------------------ games and the oracle
 
-    /// @dev The owner pins the next question at the current time and the executor buys an answer, which the
-    /// Intake delivers through the callback. IMD leaves the adapter only this way.
-    function requestAnswer(uint256 answer) external {
+    /// @dev The owner pins the next question at a commit deadline up to a day away and opens the round at the
+    /// Arena with a prize from the game pool (A7 has run: the adapter sells nothing for a round that does not
+    /// exist, so the round must be created first).
+    function openRound(uint256 prize, uint256 inSeconds) external {
+        uint256 id = arena.roundCount() + 1;
+        prize = bound(prize, 0, arena.unallocatedPrizePool());
+        uint64 commitDeadline = uint64(block.timestamp + bound(inSeconds, 1, 1 days));
+        vm.prank(owner);
+        adapter.pinQuestion(id, QUESTION, 1, 5, 4, commitDeadline, "");
+        vm.prank(owner);
+        uint256 created = arena.createRound(
+            Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1 hours, commitDeadline + 2 hours, prize, 0, 0
+        );
+        assertEq(created, id);
+        assertEq(arena.rounds(id).prize, prize);
+        openRounds.push(id);
+        nextRound = id + 1;
+    }
+
+    /// @dev Once a round's commit deadline has passed the executor buys its answer, which the Intake delivers
+    /// through the callback. IMD leaves the adapter only this way.
+    function requestAnswer(uint256 which, uint256 answer) external {
+        if (openRounds.length == 0) return;
+        uint256 id = openRounds[which % openRounds.length];
+        if (adapter.resultOf(id).settled || adapter.openRequest(id) != bytes32(0)) return;
+        if (block.timestamp < adapter.pinned(id).notBefore) return;
         uint256 price = adapter.price();
         if (imd.balanceOf(address(adapter)) < price) return;
         if (block.timestamp < adapter.windowStart() + adapter.BUDGET_WINDOW()) {
             if (adapter.spentInWindow() + price > adapter.budgetPerWindow()) return;
         }
-        uint256 id = nextRound++;
-        vm.prank(owner);
-        adapter.pinQuestion(id, QUESTION, 1, 5, 4, uint64(block.timestamp), "");
         vm.prank(executor);
         bytes32 intakeId = adapter.request(id);
         ghostOracleSpent += price;
@@ -365,7 +386,8 @@ contract LaunchRehearsalInvariantsTest is Replica {
         prio.transfer(address(handler), 40_000_000 ether);
         handler.fund();
         targetContract(address(handler));
-        bytes4[] memory sels = new bytes4[](18);
+        bytes4[] memory sels = new bytes4[](19);
+        sels[18] = SystemHandler.openRound.selector;
         sels[0] = SystemHandler.buyExactIn.selector;
         sels[1] = SystemHandler.buyExactOut.selector;
         sels[2] = SystemHandler.sellExactIn.selector;
@@ -429,7 +451,11 @@ contract LaunchRehearsalInvariantsTest is Replica {
         assertEq(handler.ghostToVault() + handler.ghostToArena(), handler.ghostPrioBought());
         assertEq(imd.balanceOf(address(adapter)), handler.ghostImdBought() - handler.ghostOracleSpent());
         assertEq(imd.balanceOf(INTAKE), handler.ghostOracleSpent());
-        assertEq(arena.unallocatedPrizePool(), handler.ghostToArena(), "the game pool is exactly the arena's half");
+        assertEq(
+            arena.unallocatedPrizePool() + arena.lockedPrizes(),
+            handler.ghostToArena(),
+            "the game pool, free or locked in open rounds, is exactly the arena's half"
+        );
         assertEq(
             vault.rewardsOwed() + handler.ghostRewardsClaimed(),
             handler.ghostToVault(),

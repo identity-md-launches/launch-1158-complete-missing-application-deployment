@@ -12,10 +12,22 @@ interface ConsumerErrors {
     error BadSignature();
 }
 
-/// @dev Drives the adapter, which holds the IMD bought for agent work, in random order: pins, paid requests,
-/// Intake callbacks with good and bad attestations, manual relays from strangers, the executor and the owner,
-/// stale clearing, budget and price changes, stray-token withdrawals and attempts on the payment asset.
-/// Ghost records hold every result the moment it was stored and every IMD movement.
+/// @dev Stands in for the Arena: the adapter reads nothing of it but `roundCount`.
+contract ArenaStub {
+    uint256 public roundCount;
+
+    function create() external {
+        roundCount++;
+    }
+}
+
+/// @dev Drives the adapter, which holds the IMD bought for agent work, in random order: pins and re-pins, the
+/// one-shot Arena binding, round creation at the Arena, paid requests, Intake callbacks with good and bad
+/// attestations, manual relays from strangers, the executor and the owner, stale clearing, budget and price
+/// changes, stray-token withdrawals and attempts on the payment asset. Both regimes are exercised: before
+/// `setArena` (pins immutable, no round check) and after it (a pin is replaceable until its round exists, and
+/// nothing is bought or stored for a round the Arena has not created). Ghost records hold every result the
+/// moment it was stored, every pin the moment its round was created, and every IMD movement.
 contract AdapterHandler is Test {
     uint256 constant SIGNER_KEY = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d;
     uint256 constant OTHER_KEY = 0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6;
@@ -25,6 +37,7 @@ contract AdapterHandler is Test {
     MockIntake intake;
     PrismRiotToken imd;
     PrismRiotToken stray;
+    ArenaStub arenaStub;
     address owner;
     address executor;
     address stranger = makeAddr("stranger");
@@ -37,19 +50,42 @@ contract AdapterHandler is Test {
     uint256 public ghostStrayIn;
     uint256 public ghostStrayOut;
     uint256 public ghostStrangerRelays;
+    uint256 public ghostCreated;
+    uint256 public ghostRepins;
+    uint256 public ghostRepinsRefused;
+    uint256 public ghostRefusedUncreated;
     uint256 boughtNonce;
     mapping(uint256 => uint256) public storedAnswer;
     mapping(uint256 => bytes32) public storedRequestId;
+    /// @dev Whether the adapter had its Arena when the result was stored (only then is the round check on).
+    mapping(uint256 => bool) public storedWhileArenaSet;
+    mapping(uint256 => bytes32) public hashAtCreation;
+    mapping(uint256 => uint64) public notBeforeAtCreation;
     bytes32[] public consumedIds;
     bytes32[] public openIds;
 
-    constructor(OracleAdapter a, MockIntake i, PrismRiotToken t, PrismRiotToken s, address owner_, address executor_) {
+    constructor(
+        OracleAdapter a,
+        MockIntake i,
+        PrismRiotToken t,
+        PrismRiotToken s,
+        ArenaStub r,
+        address owner_,
+        address executor_
+    ) {
         adapter = a;
         intake = i;
         imd = t;
         stray = s;
+        arenaStub = r;
         owner = owner_;
         executor = executor_;
+    }
+
+    /// @dev A round the adapter will take a result or a request for: any round before `setArena`, and after
+    /// it only one the Arena has created.
+    function created(uint256 roundId) public view returns (bool) {
+        return adapter.arena() == address(0) || arenaStub.roundCount() >= roundId;
     }
 
     function consumedCount() external view returns (uint256) {
@@ -93,6 +129,7 @@ contract AdapterHandler is Test {
         OracleAdapter.Result memory res = adapter.resultOf(roundId);
         storedAnswer[roundId] = res.answer;
         storedRequestId[roundId] = res.requestId;
+        storedWhileArenaSet[roundId] = adapter.arena() != address(0);
         consumedIds.push(res.requestId);
         ghostResults++;
     }
@@ -105,6 +142,54 @@ contract AdapterHandler is Test {
         uint64 notBefore = uint64(block.timestamp + bound(inSeconds, 0, 1 days));
         vm.prank(owner);
         adapter.pinQuestion(pins, QUESTION, 1, 5, 4, notBefore, "body");
+    }
+
+    /// @dev Re-pins an existing round at a new boundary. Allowed exactly when the Arena is set, has not created
+    /// the round, nothing is stored for it and no request is open; refused as `AlreadyPinned` otherwise.
+    function repin(uint256 which, uint256 inSeconds) external {
+        if (pins == 0) return;
+        uint256 roundId = bound(which, 1, pins);
+        uint64 notBefore = uint64(block.timestamp + bound(inSeconds, 0, 1 days));
+        bool replaceable = adapter.arena() != address(0) && arenaStub.roundCount() < roundId
+            && !adapter.resultOf(roundId).settled && adapter.openRequest(roundId) == bytes32(0);
+        vm.prank(owner);
+        if (replaceable) {
+            adapter.pinQuestion(roundId, QUESTION, 1, 5, 4, notBefore, "body");
+            assertEq(adapter.pinned(roundId).notBefore, notBefore, "replaced");
+            ghostRepins++;
+        } else {
+            vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, roundId));
+            adapter.pinQuestion(roundId, QUESTION, 1, 5, 4, notBefore, "body");
+            ghostRepinsRefused++;
+        }
+    }
+
+    /// @dev The owner binds the Arena once; a second binding, to anything, is refused, as is a stranger's.
+    function setArena() external {
+        vm.prank(stranger);
+        vm.expectRevert();
+        adapter.setArena(address(arenaStub));
+        bool unset = adapter.arena() == address(0);
+        vm.prank(owner);
+        if (unset) {
+            adapter.setArena(address(arenaStub));
+            assertEq(adapter.arena(), address(arenaStub));
+        } else {
+            vm.expectRevert(OracleAdapter.ArenaAlreadySet.selector);
+            adapter.setArena(address(this));
+        }
+    }
+
+    /// @dev The Arena creates its next round (only one whose question is pinned, as the real Arena requires);
+    /// the pin as it stands at that moment is what the round was created against.
+    function createNext() external {
+        uint256 roundId = arenaStub.roundCount() + 1;
+        if (roundId > pins) return;
+        OracleAdapter.Pinned memory p = adapter.pinned(roundId);
+        hashAtCreation[roundId] = p.questionHash;
+        notBeforeAtCreation[roundId] = p.notBefore;
+        arenaStub.create();
+        ghostCreated++;
     }
 
     function fundImd(uint256 amount) external {
@@ -161,10 +246,19 @@ contract AdapterHandler is Test {
         OracleAdapter.Pinned memory p = adapter.pinned(roundId);
         if (block.timestamp < p.notBefore || adapter.resultOf(roundId).settled) return;
         if (adapter.openRequest(roundId) != bytes32(0)) return;
+        if (!created(roundId)) {
+            vm.prank(executor);
+            vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, roundId));
+            adapter.request(roundId);
+            ghostRefusedUncreated++;
+            return;
+        }
         uint256 price = adapter.price();
         if (imd.balanceOf(address(adapter)) < price) return;
         if (block.timestamp < adapter.windowStart() + adapter.BUDGET_WINDOW()) {
             if (adapter.spentInWindow() + price > adapter.budgetPerWindow()) return;
+        } else if (price > adapter.budgetPerWindow()) {
+            return; // a fresh window still cannot afford one answer at this price
         }
         uint256 before = imd.balanceOf(address(adapter));
         vm.prank(executor);
@@ -188,28 +282,32 @@ contract AdapterHandler is Test {
     // ------------------------------------------------------------------ results
 
     /// @dev The Intake answers an open request. A good attestation settles the round once; a second answer
-    /// for the same round, or one with the wrong key, is refused and leaves the request pending.
+    /// for the same round, one with the wrong key, or one for a round the Arena (bound after the request was
+    /// made) has not created, is refused and leaves the request pending.
     function deliver(uint256 which, uint256 answer, bool goodKey) external {
         if (openIds.length == 0) return;
         bytes32 id = openIds[which % openIds.length];
         if (adapter.pendingSince(id) == 0) return;
         uint256 roundId = adapter.pendingRound(id);
         bool wasSettled = adapter.resultOf(roundId).settled;
+        bool exists = created(roundId);
         OracleAttestation.Attestation memory a = _att(id, answer, uint64(block.timestamp));
         bool ok = intake.deliver(abi.encode(id, a, _sign(goodKey ? SIGNER_KEY : OTHER_KEY, a)));
-        if (goodKey && !wasSettled) {
+        if (goodKey && !wasSettled && exists) {
             assertTrue(ok, "a good first answer lands under the stipend");
             assertEq(adapter.pendingSince(id), 0, "forgotten");
             assertEq(adapter.openRequest(roundId), bytes32(0));
             assertEq(adapter.resultOf(roundId).answer, answer);
             _record(roundId);
         } else {
-            assertFalse(ok, "a wrong key or a second answer is refused");
+            assertFalse(ok, "a wrong key, a second answer or an uncreated round is refused");
             assertEq(adapter.pendingRound(id), roundId, "still pending");
+            if (!exists) ghostRefusedUncreated++;
         }
     }
 
-    /// @dev Anyone may relay the answer to the adapter's own open request for the round it was made for.
+    /// @dev Anyone may relay the answer to the adapter's own open request for the round it was made for,
+    /// unless the Arena bound since has not created that round.
     function strangerRelaysOwnRequest(uint256 which, uint256 answer) external {
         if (openIds.length == 0) return;
         bytes32 id = openIds[which % openIds.length];
@@ -217,8 +315,17 @@ contract AdapterHandler is Test {
         uint256 roundId = adapter.pendingRound(id);
         if (adapter.resultOf(roundId).settled) return;
         OracleAttestation.Attestation memory a = _att(id, answer, uint64(block.timestamp));
+        bytes memory sig = _sign(SIGNER_KEY, a);
+        if (!created(roundId)) {
+            vm.prank(stranger);
+            vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, roundId));
+            adapter.submitAttestation(roundId, a, sig);
+            assertEq(adapter.openRequest(roundId), id, "the refused relay forgot nothing");
+            ghostRefusedUncreated++;
+            return;
+        }
         vm.prank(stranger);
-        adapter.submitAttestation(roundId, a, _sign(SIGNER_KEY, a));
+        adapter.submitAttestation(roundId, a, sig);
         assertEq(adapter.openRequest(roundId), bytes32(0));
         _record(roundId);
         ghostStrangerRelays++;
@@ -230,12 +337,14 @@ contract AdapterHandler is Test {
         uint256 roundId = bound(which, 1, pins);
         OracleAttestation.Attestation memory a =
             _att(keccak256(abi.encode("foreign", which, answer)), answer, uint64(block.timestamp));
+        bytes memory sig = _sign(SIGNER_KEY, a);
         vm.prank(stranger);
         vm.expectRevert(OracleAdapter.NotRelayer.selector);
-        adapter.submitAttestation(roundId, a, _sign(SIGNER_KEY, a));
+        adapter.submitAttestation(roundId, a, sig);
     }
 
-    /// @dev The owner relays a bought attestation for a round past its boundary; a second one is refused.
+    /// @dev The owner relays a bought attestation for a round past its boundary; a second one is refused, and
+    /// so is one for a round the bound Arena has not created.
     function ownerRelays(uint256 which, uint256 answer) external {
         if (pins == 0) return;
         uint256 roundId = bound(which, 1, pins);
@@ -244,17 +353,24 @@ contract AdapterHandler is Test {
         bool wasSettled = adapter.resultOf(roundId).settled;
         OracleAttestation.Attestation memory a =
             _att(keccak256(abi.encode("bought", ++boughtNonce)), answer, uint64(block.timestamp));
+        bytes memory sig = _sign(SIGNER_KEY, a);
+        bool exists = created(roundId);
         vm.prank(owner);
         if (wasSettled) {
             vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadySettled.selector, roundId));
-            adapter.submitAttestation(roundId, a, _sign(SIGNER_KEY, a));
+            adapter.submitAttestation(roundId, a, sig);
+        } else if (!exists) {
+            vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, roundId));
+            adapter.submitAttestation(roundId, a, sig);
+            ghostRefusedUncreated++;
         } else {
-            adapter.submitAttestation(roundId, a, _sign(SIGNER_KEY, a));
+            adapter.submitAttestation(roundId, a, sig);
             _record(roundId);
         }
     }
 
-    /// @dev A consumed request id can never be accepted again, for any round, by anyone.
+    /// @dev A consumed request id can never be accepted again, for any round, by anyone (for an uncreated
+    /// round the refusal comes earlier, as `RoundNotCreated`).
     function replayConsumed(uint256 which, uint256 target) external {
         if (consumedIds.length == 0 || pins == 0) return;
         bytes32 id = consumedIds[which % consumedIds.length];
@@ -262,9 +378,15 @@ contract AdapterHandler is Test {
         OracleAdapter.Pinned memory p = adapter.pinned(roundId);
         if (block.timestamp < p.notBefore || adapter.resultOf(roundId).settled) return;
         OracleAttestation.Attestation memory a = _att(id, 7, uint64(block.timestamp));
+        bytes memory sig = _sign(SIGNER_KEY, a);
+        bool exists = created(roundId);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(ConsumerErrors.AlreadyConsumed.selector, id));
-        adapter.submitAttestation(roundId, a, _sign(SIGNER_KEY, a));
+        if (exists) {
+            vm.expectRevert(abi.encodeWithSelector(ConsumerErrors.AlreadyConsumed.selector, id));
+        } else {
+            vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, roundId));
+        }
+        adapter.submitAttestation(roundId, a, sig);
     }
 
     function clearStale(uint256 which) external {
@@ -297,6 +419,7 @@ contract OracleAdapterInvariantsTest is Test {
     MockIntake intake;
     PrismRiotToken imd;
     PrismRiotToken stray;
+    ArenaStub arenaStub;
     AdapterHandler handler;
     address owner = makeAddr("owner");
     address executor = makeAddr("executor");
@@ -306,6 +429,7 @@ contract OracleAdapterInvariantsTest is Test {
         intake = new MockIntake();
         imd = new PrismRiotToken();
         stray = new PrismRiotToken();
+        arenaStub = new ArenaStub();
         adapter = new OracleAdapter(owner, SIGNER);
         vm.startPrank(owner);
         adapter.setIntake(IIntake(address(intake)));
@@ -315,13 +439,16 @@ contract OracleAdapterInvariantsTest is Test {
         adapter.setExecutor(executor);
         adapter.setBudget(2 ether);
         vm.stopPrank();
-        handler = new AdapterHandler(adapter, intake, imd, stray, owner, executor);
+        handler = new AdapterHandler(adapter, intake, imd, stray, arenaStub, owner, executor);
         imd.transfer(address(handler), 1_000 ether);
         stray.transfer(address(handler), 1_000 ether);
         handler.pin(0);
         handler.fundImd(5 ether);
         targetContract(address(handler));
-        bytes4[] memory sels = new bytes4[](17);
+        bytes4[] memory sels = new bytes4[](20);
+        sels[17] = AdapterHandler.setArena.selector;
+        sels[18] = AdapterHandler.createNext.selector;
+        sels[19] = AdapterHandler.repin.selector;
         sels[0] = AdapterHandler.pin.selector;
         sels[1] = AdapterHandler.fundImd.selector;
         sels[2] = AdapterHandler.setBudget.selector;
@@ -388,6 +515,29 @@ contract OracleAdapterInvariantsTest is Test {
             } else {
                 assertEq(adapter.openRequest(adapter.pendingRound(id)), id, "a pending request is its round's open one");
             }
+        }
+    }
+
+    /// @dev Once the Arena is bound it never changes, and from then on no result is stored for a round it has
+    /// not created: every result stored while the Arena was set belongs to a created round, so no id (and no
+    /// later id, since they are sequential) can be made impossible to create by an answer on file.
+    function invariant_resultsOnlyForCreatedRoundsOnceArenaIsBound() public view {
+        assertEq(arenaStub.roundCount(), handler.ghostCreated());
+        if (adapter.arena() == address(0)) return;
+        assertEq(adapter.arena(), address(arenaStub), "one-shot");
+        for (uint256 id = 1; id <= handler.pins(); id++) {
+            if (!adapter.resultOf(id).settled || !handler.storedWhileArenaSet(id)) continue;
+            assertLe(id, arenaStub.roundCount(), "a result stored under the Arena check belongs to a created round");
+        }
+    }
+
+    /// @dev A pin is frozen from the moment its round exists: what the Arena created the round against is what
+    /// the adapter still pins, so a result can only ever answer the question the players committed to.
+    function invariant_pinsAreFrozenOnceTheirRoundExists() public view {
+        for (uint256 id = 1; id <= arenaStub.roundCount(); id++) {
+            OracleAdapter.Pinned memory p = adapter.pinned(id);
+            assertEq(p.questionHash, handler.hashAtCreation(id), "question frozen");
+            assertEq(p.notBefore, handler.notBeforeAtCreation(id), "boundary frozen");
         }
     }
 

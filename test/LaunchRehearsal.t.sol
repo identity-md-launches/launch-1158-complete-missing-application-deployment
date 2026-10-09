@@ -222,16 +222,30 @@ contract LaunchRehearsalTest is Replica {
         hook.bindTreasury(payable(address(decoy)));
     }
 
-    /// @dev Signing phase A twice before any money moved changes nothing; after income and a purchase the
-    /// permanent bindings refuse to move, and the re-settable ones still accept the same value.
+    /// @dev Signing phase A twice before any money moved changes nothing, except A7, which is one-shot from its
+    /// first signature. After income and a PRIO purchase the PRIO-line bindings and the hook refuse to move; A3
+    /// still accepts the same three addresses (the IMD line stays correctable), and the re-settable steps still
+    /// accept the same value.
     function test_planIsIdempotentBeforeMoneyMovesAndFrozenAfter() public {
         deployApplications();
         seedPrioOnly(8.7e22);
         seedImdPool(8e20, 50 ether);
         runPlan();
-        runPlan();
+        ConfigPlan.Step[] memory steps = planner.plan(apps(), params());
+        for (uint256 i; i < steps.length; i++) {
+            vm.prank(OWNER);
+            (bool ok, bytes memory ret) = steps[i].target.call(steps[i].data);
+            if (i == 6) {
+                assertFalse(ok, "A7 is one-shot from the first signature");
+                assertEq(bytes4(ret), OracleAdapter.ArenaAlreadySet.selector);
+            } else {
+                assertTrue(ok, string.concat("idempotent before money moves: ", steps[i].label));
+            }
+        }
         assertEq(treasury.hook(), HOOK);
         assertEq(hook.treasury(), address(treasury));
+        assertEq(adapter.arena(), address(arena));
+        assertFalse(treasury.purchased());
         earnFees(0.5 ether);
         assertGt(treasury.totalIncome(), 0);
         treasury.allocate();
@@ -241,22 +255,73 @@ contract LaunchRehearsalTest is Replica {
         vm.prank(executor);
         treasury.buyPrio(half, 1);
         assertTrue(treasury.purchased());
-        ConfigPlan.Step[] memory steps = planner.plan(apps(), params());
+        assertTrue(treasury.prioPurchased());
+        assertFalse(treasury.imdPurchased(), "no IMD has flowed yet");
         bytes4[20] memory expected;
         expected[0] = FeeTreasury.HookAlreadyBound.selector;
         expected[1] = FeeTreasury.AlreadySet.selector;
-        expected[2] = FeeTreasury.AlreadySet.selector;
         expected[3] = TreasuryFeeHook.TreasuryAlreadyBound.selector;
+        expected[6] = OracleAdapter.ArenaAlreadySet.selector;
         for (uint256 i; i < steps.length; i++) {
             vm.prank(OWNER);
             (bool ok, bytes memory ret) = steps[i].target.call(steps[i].data);
-            if (i < 4) {
+            if (expected[i] != bytes4(0)) {
                 assertFalse(ok, string.concat("permanent: ", steps[i].label));
                 assertEq(bytes4(ret), expected[i], steps[i].label);
             } else {
                 assertTrue(ok, string.concat("re-settable: ", steps[i].label));
             }
         }
+    }
+
+    /// @dev The freeze is per allocation line. After only PRIO has been bought, the vault and the arena cannot
+    /// move (not even one of them), but the OracleAdapter sink and the IMD token still can, so a wrong third
+    /// argument in A3 is correctable until IMD has actually flowed; after the first IMD purchase that line
+    /// freezes too, and only the venue (`setImdPool`) stays movable.
+    function test_sinkFreezeIsPerLineOnTheReplica() public {
+        deployApplications();
+        seedPrioOnly(8.7e22);
+        seedImdPool(8e20, 50 ether);
+        runPlan();
+        earnFees(0.5 ether);
+        treasury.allocate();
+        vm.prank(OWNER);
+        treasury.setPriceFloors(1e7 ether, 50 ether);
+        uint256 halfPrio = treasury.prioBudget() / 2;
+        vm.prank(executor);
+        treasury.buyPrio(halfPrio, 1);
+        OracleAdapter spare = new OracleAdapter(OWNER, ORACLE_SIGNER);
+        vm.startPrank(OWNER);
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setSinks(address(0xBEEF), address(arena), address(adapter));
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setSinks(address(vault), address(0xBEEF), address(adapter));
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setPrio(address(0xBEEF));
+        treasury.setSinks(address(vault), address(arena), address(spare)); // the IMD line is still correctable
+        assertEq(treasury.oracleAdapter(), address(spare));
+        treasury.setSinks(address(vault), address(arena), address(adapter)); // and corrected back
+        treasury.setImd(address(0xBEEF)); // the IMD token too, which unsets the pool
+        assertFalse(treasury.imdPoolSet());
+        treasury.setImd(IMD);
+        treasury.setImdPool(planner.IMD_POOL_FEE(), planner.IMD_POOL_TICK_SPACING(), planner.IMD_POOL_HOOKS());
+        vm.stopPrank();
+        uint256 adapterBefore = imd.balanceOf(address(adapter));
+        uint256 halfImd = treasury.imdBudget() / 2;
+        vm.prank(executor);
+        uint256 out = treasury.buyImd(halfImd, 1);
+        assertGt(out, 0);
+        assertEq(imd.balanceOf(address(adapter)), adapterBefore + out, "IMD landed at the configured adapter");
+        assertEq(imd.balanceOf(address(spare)), 0, "and nowhere else");
+        assertTrue(treasury.imdPurchased());
+        vm.startPrank(OWNER);
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setSinks(address(vault), address(arena), address(spare));
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setImd(address(0xBEEF));
+        treasury.setSinks(address(vault), address(arena), address(adapter)); // the frozen values are accepted
+        treasury.setImdPool(planner.IMD_POOL_FEE(), planner.IMD_POOL_TICK_SPACING(), planner.IMD_POOL_HOOKS());
+        vm.stopPrank();
     }
 
     // ------------------------------------------------------------------ nothing paid before funding
@@ -269,8 +334,17 @@ contract LaunchRehearsalTest is Replica {
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.QuestionNotPinned.selector, 1));
         adapter.request(1);
+        uint64 commitDeadline = uint64(block.timestamp + 1);
         vm.prank(OWNER);
-        adapter.pinQuestion(1, QUESTION, 1, 5, 4, uint64(block.timestamp), "");
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, commitDeadline, "");
+        // A7 has run: nothing is bought for a round the Arena has not created, however the pin looks.
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, 1));
+        adapter.request(1);
+        // A round without a prize can open (nothing is promised); the answer is still unaffordable.
+        vm.prank(OWNER);
+        arena.createRound(Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1, commitDeadline + 2, 0, 0, 0);
+        vm.warp(commitDeadline);
         vm.prank(executor);
         vm.expectRevert(
             abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, address(adapter), 0, 0.5 ether)
@@ -312,6 +386,66 @@ contract LaunchRehearsalTest is Replica {
         vm.prank(OWNER);
         (bool ok,) = address(treasury).call{value: 1 ether}("");
         assertFalse(ok, "no owner operating advances");
+    }
+
+    /// @dev The checklist says to sign A7 before the first pin. The cost of ignoring it: a paid request made
+    /// while the adapter knows no Arena is accepted for a round nobody has created; once A7 is signed its
+    /// answer is refused, the request blocks the pin until it goes stale, and the price is spent for nothing.
+    /// Nothing is stuck for good: after the timeout the pin can be corrected and the round played normally.
+    function test_requestBeforeA7IsStrandedUntilStale_thenRecoverable() public {
+        deployApplications();
+        seedPrioOnly(8.7e22);
+        ConfigPlan.Step[] memory steps = planner.plan(apps(), params());
+        for (uint256 i; i < steps.length; i++) {
+            if (i != 6) execStep(steps[i]);
+        }
+        execStep(planner.executorStep(apps(), params()));
+        assertEq(adapter.arena(), address(0), "A7 skipped");
+        vm.prank(imdWhale);
+        imd.transfer(address(adapter), 1 ether); // stands in for an IMD purchase
+        vm.startPrank(OWNER);
+        adapter.setSigner(vm.addr(SIGNER_KEY)); // the key this test holds, so a refusal below is never the signature
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, uint64(block.timestamp), "");
+        vm.stopPrank();
+        vm.prank(executor);
+        bytes32 intakeId = adapter.request(1); // accepted: nothing checks the Arena yet
+        assertEq(imd.balanceOf(INTAKE), 0.5 ether);
+        execStep(steps[6]); // A7, late
+        OracleAttestation.Attestation memory a = attestation(intakeId, QUESTION, 2, uint64(block.timestamp));
+        bytes memory sig = sign(a);
+        assertFalse(intake.deliver(abi.encode(intakeId, a, sig)), "callback refused: round 1 does not exist");
+        assertEq(adapter.openRequest(1), intakeId, "still open");
+        assertFalse(adapter.resultOf(1).settled);
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RoundNotCreated.selector, 1));
+        adapter.submitAttestation(1, a, sig); // the owner's relay is refused for the same reason
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 1));
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, uint64(block.timestamp + 1 hours), "");
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RequestPending.selector, 1));
+        adapter.request(1);
+        vm.expectRevert(OracleAdapter.RequestNotStale.selector);
+        adapter.clearStale(intakeId);
+        skip(adapter.REQUEST_TIMEOUT());
+        adapter.clearStale(intakeId);
+        assertEq(imd.balanceOf(address(adapter)), 0.5 ether, "the price is gone");
+        // Recovery: re-pin at the round's commit deadline, create the round, buy the answer again.
+        uint64 commitDeadline = uint64(block.timestamp + 1 hours);
+        vm.startPrank(OWNER);
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, commitDeadline, "");
+        arena.createRound(
+            Arena.Mode.VaultRaid, 4, commitDeadline, commitDeadline + 1 hours, commitDeadline + 2 hours, 0, 0, 0
+        );
+        vm.stopPrank();
+        vm.warp(commitDeadline);
+        vm.prank(executor);
+        bytes32 second = adapter.request(1);
+        assertTrue(second != intakeId);
+        a = attestation(second, QUESTION, 2, uint64(block.timestamp));
+        assertTrue(intake.deliver(abi.encode(second, a, sign(a))));
+        assertTrue(adapter.resultOf(1).settled);
+        assertEq(imd.balanceOf(address(adapter)), 0, "two answers paid, one used");
     }
 
     // ------------------------------------------------------------------ the economy, end to end
