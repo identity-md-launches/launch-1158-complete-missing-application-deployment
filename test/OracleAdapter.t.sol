@@ -92,7 +92,9 @@ contract OracleAdapterTest is Test {
 
     function test_manualRelayStoresResultAndEvidence() public {
         OracleAttestation.Attestation memory a = roundAnswer(7);
-        adapter.submitAttestation(1, a, sign(a));
+        bytes memory sig = sign(a);
+        vm.prank(owner);
+        adapter.submitAttestation(1, a, sig);
         OracleAdapter.Result memory r = adapter.resultOf(1);
         assertTrue(r.settled);
         assertEq(r.answer, 7);
@@ -105,12 +107,15 @@ contract OracleAdapterTest is Test {
     function test_relayRejectsReplayAndSecondResult() public {
         OracleAttestation.Attestation memory a = roundAnswer(7);
         bytes memory sig = sign(a);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadySettled.selector, 1));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         vm.prank(owner);
         adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
         vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumerErrors.AlreadyConsumed.selector, a.requestId));
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
     }
 
@@ -120,18 +125,21 @@ contract OracleAdapterTest is Test {
         a.questionHash = keccak256("other");
         sig = sign(a);
         vm.expectRevert(OracleAdapter.QuestionMismatch.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         a.chainId = 2;
         sig = sign(a);
         vm.expectRevert(OracleAdapter.ChainMismatch.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         a.agreed = 3;
         sig = sign(a);
         vm.expectRevert(OracleAdapter.NotAgreed.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
@@ -139,24 +147,28 @@ contract OracleAdapterTest is Test {
         a.agreed = 3;
         sig = sign(a);
         vm.expectRevert(OracleAdapter.QuorumTooSmall.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         a.panelSize = 4;
         sig = sign(a);
         vm.expectRevert(OracleAdapter.PanelTooSmall.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         sig = sign(a);
         a.figure = 1; // tampered after signing
         vm.expectRevert(OracleAttestationConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         sig = sign(a);
         vm.warp(EXPIRES_AT + 1);
         vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumerErrors.AttestationExpired.selector, EXPIRES_AT));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         vm.warp(ISSUED_AT);
 
@@ -165,6 +177,7 @@ contract OracleAdapterTest is Test {
         a.answer = abi.encode(true);
         sig = sign(a);
         vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumerErrors.WrongAnswerType.selector, 3, 0));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
@@ -173,11 +186,13 @@ contract OracleAdapterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(OracleAdapter.IssuedTooEarly.selector, ISSUED_AT - 2 hours, ISSUED_AT - 1 hours)
         );
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
 
         a = roundAnswer(1);
         sig = sign(a);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.QuestionNotPinned.selector, 9));
+        vm.prank(owner);
         adapter.submitAttestation(9, a, sig);
     }
 
@@ -234,14 +249,121 @@ contract OracleAdapterTest is Test {
         vm.prank(address(this));
         vm.expectRevert(OracleAdapter.NotExecutor.selector);
         adapter.request(1);
+        // One request per round is open at a time, so the budget is exercised across rounds.
+        vm.startPrank(owner);
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        adapter.pinQuestion(3, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        adapter.pinQuestion(4, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        vm.stopPrank();
         vm.startPrank(executor);
         adapter.request(1);
-        adapter.request(1);
+        adapter.request(2);
         vm.expectRevert(OracleAdapter.BudgetExceeded.selector);
-        adapter.request(1);
+        adapter.request(3);
         skip(1 days);
-        adapter.request(1);
+        adapter.request(3);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RequestPending.selector, 3));
+        adapter.request(3);
         vm.stopPrank();
+    }
+
+    /// @dev Finding d260feaf: any attestation for the pinned question used to settle the round, so whoever
+    /// bought and relayed a second panel answer first chose the result. Now an attestation settles a round
+    /// from any relayer only when it answers this adapter's own request; others need the executor or owner.
+    function test_competingAttestationCannotBeRelayedByAStranger_ownRequestCanBeRelayedByAnyone() public {
+        configurePaid();
+        vm.prank(executor);
+        bytes32 id = adapter.request(1);
+        assertEq(adapter.openRequest(1), id);
+        // A player buys their own answer to the public question and tries to relay it first.
+        OracleAttestation.Attestation memory bought = roundAnswer(2);
+        bytes memory boughtSig = sign(bought);
+        vm.prank(makeAddr("player"));
+        vm.expectRevert(OracleAdapter.NotRelayer.selector);
+        adapter.submitAttestation(1, bought, boughtSig);
+        assertFalse(adapter.resultOf(1).settled);
+        // The answer to the adapter's own request carries its request id: anyone may relay it.
+        OracleAttestation.Attestation memory own = roundAnswer(1);
+        own.requestId = id;
+        bytes memory ownSig = sign(own);
+        vm.prank(makeAddr("anyone"));
+        adapter.submitAttestation(1, own, ownSig);
+        assertEq(adapter.resultOf(1).answer, 1);
+        assertEq(adapter.openRequest(1), bytes32(0), "the open request is closed by its answer");
+        assertEq(adapter.pendingSince(id), 0);
+        // The bought answer can no longer be used by anyone, trusted or not.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadySettled.selector, 1));
+        adapter.submitAttestation(1, bought, boughtSig);
+    }
+
+    function test_ownRequestIdForAnotherRoundIsNotAFreePass() public {
+        configurePaid();
+        vm.prank(owner);
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        vm.prank(executor);
+        bytes32 id = adapter.request(2);
+        OracleAttestation.Attestation memory a = roundAnswer(5);
+        a.requestId = id;
+        bytes memory sig = sign(a);
+        // The request was for round 2; relaying its answer into round 1 is a stranger's relay.
+        vm.prank(makeAddr("anyone"));
+        vm.expectRevert(OracleAdapter.NotRelayer.selector);
+        adapter.submitAttestation(1, a, sig);
+        // The executor may relay an attestation it obtained off chain (HTTP door) for any round.
+        OracleAttestation.Attestation memory offChain = roundAnswer(8);
+        bytes memory offSig = sign(offChain);
+        vm.prank(executor);
+        adapter.submitAttestation(1, offChain, offSig);
+        assertEq(adapter.resultOf(1).answer, 8);
+    }
+
+    function test_secondRequestForAnOpenRoundIsRefusedUntilAnsweredOrCleared() public {
+        configurePaid();
+        vm.prank(executor);
+        bytes32 id = adapter.request(1);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.RequestPending.selector, 1));
+        adapter.request(1);
+        skip(2 days);
+        adapter.clearStale(id);
+        assertEq(adapter.openRequest(1), bytes32(0));
+        vm.prank(executor);
+        bytes32 second = adapter.request(1);
+        assertTrue(second != id);
+        OracleAttestation.Attestation memory a = roundAnswer(4);
+        a.issuedAt = uint64(block.timestamp);
+        a.expiresAt = uint64(block.timestamp + 1 hours);
+        assertTrue(intake.deliver(abi.encode(second, a, sign(a))), "the callback answers the open request");
+        assertEq(adapter.openRequest(1), bytes32(0));
+        assertEq(imd.balanceOf(address(intake)), 1 ether, "two answers were paid for, not three");
+    }
+
+    /// @dev Finding 0fb49e68: a pin whose `notBefore` can never match a future round blocked every round.
+    function test_mistakenPinCanBeReplacedUntilTheArenaCreatesTheRound() public {
+        ArenaStub stub = new ArenaStub();
+        vm.startPrank(owner);
+        // Without a configured Arena the pin stays immutable (conservative default).
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 1));
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, ISSUED_AT + 1 days, "");
+        adapter.setArena(address(stub));
+        // Round 1 not created yet (roundCount 0): the pin can be corrected.
+        adapter.pinQuestion(1, keccak256("corrected"), 1, 6, 5, ISSUED_AT + 1 days, "body");
+        assertEq(adapter.pinned(1).questionHash, keccak256("corrected"));
+        assertEq(adapter.pinned(1).notBefore, ISSUED_AT + 1 days);
+        // Once the Arena has created it, the pin is frozen.
+        stub.set(1);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 1));
+        adapter.pinQuestion(1, QUESTION, 1, 5, 4, ISSUED_AT + 2 days, "");
+        // A settled round or an open request also freezes the pin.
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, ISSUED_AT - 1 hours, "");
+        vm.stopPrank();
+        configurePaid();
+        vm.prank(executor);
+        adapter.request(2);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadyPinned.selector, 2));
+        adapter.pinQuestion(2, keccak256("x"), 1, 5, 4, ISSUED_AT - 1 hours, "");
     }
 
     // ------------------------------------------------------------------ the commit boundary
@@ -256,6 +378,7 @@ contract OracleAdapterTest is Test {
         a.issuedAt = uint64(block.timestamp);
         bytes memory sig = sign(a);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.BeforeBoundary.selector, boundary));
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
         assertFalse(adapter.resultOf(2).settled);
         configurePaid();
@@ -266,6 +389,7 @@ contract OracleAdapterTest is Test {
         vm.warp(boundary);
         vm.prank(executor);
         adapter.request(2);
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
         assertEq(adapter.resultOf(2).answer, 6);
     }
@@ -275,6 +399,7 @@ contract OracleAdapterTest is Test {
         bytes memory sig = sign(a);
         vm.prank(owner);
         adapter.setSigner(makeAddr("rotated"));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         assertEq(adapter.resultOf(1).answer, 4);
         // A question pinned after the rotation needs the new signer.
@@ -283,6 +408,7 @@ contract OracleAdapterTest is Test {
         a = roundAnswer(5);
         sig = sign(a);
         vm.expectRevert(OracleAttestationConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(3, a, sig);
     }
 
@@ -308,6 +434,15 @@ contract OracleAdapterTest is Test {
         skip(2 days);
         adapter.clearStale(id);
         assertEq(adapter.pendingSince(id), 0);
+    }
+}
+
+/// @dev Stands in for the Arena's `roundCount()`.
+contract ArenaStub {
+    uint256 public roundCount;
+
+    function set(uint256 n) external {
+        roundCount = n;
     }
 }
 

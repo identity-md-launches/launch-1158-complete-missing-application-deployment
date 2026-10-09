@@ -76,6 +76,19 @@
   },
   {
     "type": "function",
+    "name": "arena",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "asset",
     "inputs": [],
     "outputs": [
@@ -412,6 +425,25 @@
   },
   {
     "type": "function",
+    "name": "openRequest",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "intakeId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "oracleSigner",
     "inputs": [],
     "outputs": [
@@ -719,6 +751,19 @@
   },
   {
     "type": "function",
+    "name": "setArena",
+    "inputs": [
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "setBudget",
     "inputs": [
       {
@@ -971,6 +1016,19 @@
         "type": "bytes32",
         "indexed": true,
         "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ArenaSet",
+    "inputs": [
+      {
+        "name": "arena",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -1333,6 +1391,11 @@
   },
   {
     "type": "error",
+    "name": "NotRelayer",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NotTheIntake",
     "inputs": []
   },
@@ -1393,6 +1456,17 @@
     "type": "error",
     "name": "RequestNotStale",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RequestPending",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

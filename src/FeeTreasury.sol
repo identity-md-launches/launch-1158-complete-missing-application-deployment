@@ -26,6 +26,11 @@ interface IPrizeSink {
     function fundPrizes(uint256 amount) external;
 }
 
+/// @notice What a PRIO sink (StakingVault, Arena) reports as its token.
+interface IPrioSink {
+    function prio() external view returns (address);
+}
+
 /// @title FeeTreasury: earned ETH fees, and nothing else, fund the project
 /// @notice Only the bound `TreasuryFeeHook` may send ETH here: there is no owner top-up path, so no income
 /// means no paid operations. `allocate()` (permissionless) splits every new wei of income:
@@ -34,14 +39,22 @@ interface IPrizeSink {
 ///   2. of the remainder: 30% IMD purchase budget (agent work), 30% PRIO purchase budget (rewards),
 ///      40% owner budget.
 /// Budgets are spent only by the executor through bounded, slippage-checked swaps on the Uniswap v4
-/// PoolManager: at most `maxSpendPerSwap` ETH per call, at most `spendPerWindow` ETH per rolling
-/// `SPEND_WINDOW` across both purchases, and never below the owner's price floors (`minPrioPerEth`,
+/// PoolManager: at most `maxSpendPerSwap` ETH per call, at most `spendPerWindow` ETH per `SPEND_WINDOW`
+/// bucket across both purchases, and never below the owner's price floors (`minPrioPerEth`,
 /// `minImdPerEth`), so a compromised executor key is bounded in rate and cannot buy at a self-set price.
-/// A swap that fills only partly (thin liquidity) spends only what the pool took; the rest stays on its
-/// budget line, so every wei the contract holds is always on exactly one line. Purchased PRIO is split
-/// equally between the StakingVault (reward stream) and the Arena (game pool). Purchased IMD goes to the
-/// OracleAdapter. PRIO purchases depend only on the hook's own pool; IMD purchases wait for an owner-set
-/// IMD pool key. The reserve pays operator gas (`withdrawReserve`): a fee-funded bootstrap, never an advance.
+/// The window is a fixed bucket, not a sliding one: it starts at the first purchase after the previous
+/// bucket expired and lasts `SPEND_WINDOW`, so the most that can leave in any 24-hour span is
+/// 2 x `spendPerWindow` (the end of one bucket and the start of the next). Size `spendPerWindow` with that
+/// bound in mind. A swap that fills only partly (thin liquidity) spends only what the pool took; the rest
+/// stays on its budget line, so every wei the contract holds is always on exactly one line. Purchased PRIO
+/// is split equally between the StakingVault (reward stream) and the Arena (game pool). Purchased IMD goes
+/// to the OracleAdapter. PRIO purchases depend only on the hook's own pool; IMD purchases wait for an
+/// owner-set IMD pool key. The reserve pays operator gas (`withdrawReserve`): a fee-funded bootstrap, never
+/// an advance. The executor may draw it only to its own address and at most `reservePerWindow` per bucket.
+///
+/// Bindings (`bindHook`, `setPrio`, `setSinks`) can be corrected by the owner until they have been used:
+/// the hook until the first fee arrives, PRIO and the sinks until the first purchase. From then on they are
+/// immutable, so the 30% PRIO and 30% IMD allocations can never be redirected once money has flowed.
 contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
@@ -66,10 +79,17 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     address public executor;
     uint256 public reserveTarget = 0.5 ether;
     uint256 public maxSpendPerSwap = 1 ether;
-    /// @notice ETH the executor may spend on purchases per rolling `SPEND_WINDOW`.
+    /// @notice ETH the executor may spend on purchases per `SPEND_WINDOW` bucket (see the contract notice).
     uint256 public spendPerWindow = 1 ether;
     uint256 public windowStart;
     uint256 public spentInWindow;
+    /// @notice ETH the executor may draw from the reserve to itself per `SPEND_WINDOW` bucket. The owner's
+    /// own reserve withdrawals are not rate-limited.
+    uint256 public reservePerWindow = 0.05 ether;
+    uint256 public reserveWindowStart;
+    uint256 public reserveSpentInWindow;
+    /// @notice True once a purchase has succeeded: PRIO and the sinks are frozen from then on.
+    bool public purchased;
     /// @notice Price floors, token units (18 decimals) per 1 ETH spent. Zero means not configured: refused.
     uint256 public minPrioPerEth;
     uint256 public minImdPerEth;
@@ -93,6 +113,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     event ReserveTargetSet(uint256 target);
     event MaxSpendSet(uint256 maxSpend);
     event SpendPerWindowSet(uint256 perWindow);
+    event ReservePerWindowSet(uint256 perWindow);
     event PriceFloorsSet(uint256 minPrioPerEth, uint256 minImdPerEth);
     event ImdPoolSet(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks);
     event PrioBought(uint256 ethIn, uint256 prioOut, uint256 toStaking, uint256 toArena);
@@ -114,6 +135,8 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     error NotPoolManager();
     error TooHigh();
     error TransferFailed();
+    error SinkMismatch();
+    error WrongDestination();
 
     constructor(IPoolManager poolManager_, address owner_) TwoStepOwned(owner_) {
         if (address(poolManager_) == address(0)) revert ZeroAddress();
@@ -131,15 +154,18 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
 
     // ------------------------------------------------------------------ configuration (owner)
 
+    /// @notice The hook whose fees fund this treasury. Correctable until the first fee has arrived, so a
+    /// wrong address can be fixed before it matters; immutable afterwards.
     function bindHook(address hook_) external onlyOwner {
-        if (hook != address(0)) revert HookAlreadyBound();
+        if (totalIncome != 0) revert HookAlreadyBound();
         if (hook_ == address(0)) revert ZeroAddress();
         hook = hook_;
         emit HookBound(hook_);
     }
 
+    /// @notice The PRIO token purchases buy. Correctable until the first purchase; immutable afterwards.
     function setPrio(address prio_) external onlyOwner {
-        if (address(prio) != address(0)) revert AlreadySet();
+        if (purchased) revert AlreadySet();
         if (prio_ == address(0)) revert ZeroAddress();
         prio = IERC20(prio_);
         emit PrioSet(prio_);
@@ -154,10 +180,16 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         emit ImdSet(imd_);
     }
 
-    /// @notice Where purchases go. Set once: the 30% PRIO and 30% IMD allocations cannot be redirected later.
+    /// @notice Where purchases go. The vault and the arena must report the configured PRIO as their token (a
+    /// swapped or foreign sink is refused). Correctable until the first purchase; from then on the 30% PRIO
+    /// and 30% IMD allocations cannot be redirected.
     function setSinks(address stakingVault_, address arena_, address oracleAdapter_) external onlyOwner {
-        if (stakingVault != address(0)) revert AlreadySet();
+        if (purchased) revert AlreadySet();
         if (stakingVault_ == address(0) || arena_ == address(0) || oracleAdapter_ == address(0)) revert ZeroAddress();
+        if (address(prio) == address(0)) revert NotConfigured("prio");
+        if (IPrioSink(stakingVault_).prio() != address(prio) || IPrioSink(arena_).prio() != address(prio)) {
+            revert SinkMismatch();
+        }
         stakingVault = stakingVault_;
         arena = arena_;
         oracleAdapter = oracleAdapter_;
@@ -183,6 +215,12 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
     function setSpendPerWindow(uint256 perWindow) external onlyOwner {
         spendPerWindow = perWindow;
         emit SpendPerWindowSet(perWindow);
+    }
+
+    /// @notice How much reserve ETH the executor may draw to itself per `SPEND_WINDOW` bucket.
+    function setReservePerWindow(uint256 perWindow) external onlyOwner {
+        reservePerWindow = perWindow;
+        emit ReservePerWindowSet(perWindow);
     }
 
     /// @notice Minimum token units per ETH a purchase must return, whatever `minOut` the executor passes. The
@@ -240,9 +278,20 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         emit OwnerWithdrawn(to, amount);
     }
 
-    /// @notice Gas for the operator wallet, from the fee-funded reserve only.
+    /// @notice Gas for the operator wallet, from the fee-funded reserve only. The owner may send it anywhere;
+    /// the executor may draw it only to its own address and at most `reservePerWindow` per bucket, so a
+    /// stolen executor key cannot empty the reserve.
     function withdrawReserve(address payable to, uint256 amount) external nonReentrant {
-        if (msg.sender != owner() && msg.sender != executor) revert NotExecutor();
+        if (msg.sender != owner()) {
+            if (msg.sender != executor) revert NotExecutor();
+            if (to != executor) revert WrongDestination();
+            if (block.timestamp >= reserveWindowStart + SPEND_WINDOW) {
+                reserveWindowStart = block.timestamp;
+                reserveSpentInWindow = 0;
+            }
+            if (reserveSpentInWindow + amount > reservePerWindow) revert ExceedsWindow();
+            reserveSpentInWindow += amount;
+        }
         if (amount > reserve) revert ExceedsBudget();
         reserve -= amount;
         _send(to, amount);
@@ -263,6 +312,7 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         uint256 spent;
         (out, spent) = _swapEthFor(IFeeHook(hook).poolKey(), ethIn, minPrioOut, minPrioPerEth);
         prioBudget += ethIn - spent;
+        purchased = true;
         uint256 toStaking = out / 2;
         uint256 toArena = out - toStaking;
         prio.forceApprove(stakingVault, toStaking);
@@ -284,14 +334,15 @@ contract FeeTreasury is IUnlockCallback, TwoStepOwned, ReentrancyGuard {
         uint256 spent;
         (out, spent) = _swapEthFor(_imdPoolKey, ethIn, minImdOut, minImdPerEth);
         imdBudget += ethIn - spent;
+        purchased = true;
         imd.safeTransfer(oracleAdapter, out);
         emit ImdBought(spent, out);
     }
 
     // ------------------------------------------------------------------ swap plumbing
 
-    /// @dev Bounds the spend per call and per rolling window on what was actually spent, and checks both the
-    /// executor's `minOut` and the owner's price floor (scaled to the ETH actually spent).
+    /// @dev Bounds the spend per call and per `SPEND_WINDOW` bucket on what was actually spent, and checks both
+    /// the executor's `minOut` and the owner's price floor (scaled to the ETH actually spent).
     function _swapEthFor(PoolKey memory key, uint256 ethIn, uint256 minOut, uint256 floorPerEth)
         internal
         returns (uint256 out, uint256 spent)

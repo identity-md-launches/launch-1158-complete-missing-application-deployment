@@ -15,8 +15,10 @@ authority: it can only spend what the owner budgeted on chain (`OracleAdapter.se
    after fees have accrued; there is no other gas source.
 3. Set the same wallet as executor on chain: `FeeTreasury.setExecutor` and `OracleAdapter.setExecutor`.
    What that wallet can do is bounded on chain whatever happens to the key: `FeeTreasury` allows at most
-   `maxSpendPerSwap` per purchase and `spendPerWindow` per rolling day, never below the owner's price
-   floors (`setPriceFloors`); `OracleAdapter` allows `budgetPerWindow` IMD per day. The owner should keep
+   `maxSpendPerSwap` per purchase and `spendPerWindow` per 24-hour bucket (a fixed bucket, so at most
+   twice that in any 24-hour span), never below the owner's price floors (`setPriceFloors`), and reserve
+   draws only to the executor itself within `reservePerWindow`; `OracleAdapter` allows `budgetPerWindow`
+   IMD per day. The owner should keep
    the price floors a little below the market price and re-set them when PRIO or IMD move a lot: a floor
    above the market makes purchases revert (safe), never overpay.
 4. Leave `paid_operations_enabled` at `false` until the owner has done the "After launch" steps in
@@ -33,6 +35,7 @@ authority: it can only spend what the owner budgeted on chain (`OracleAdapter.se
 | `poll <requestId>` | polls the request status with the configured interval and attempt cap | no |
 | `relay <roundId> <attestation.json> [--dry-run]` | manual result delivery: `OracleAdapter.submitAttestation` | gas only |
 | `propose "<brief>" [--dry-run]` | `job.open` for challenge text / artwork; stores the proposal under `proposals/` | yes |
+| `buy-prio` / `buy-imd [--dry-run]` | `FeeTreasury.buyPrio` / `buyImd` with `purchases.eth_per_buy`, simulated first with `cast call`. A `PriceLimitAlreadyExceeded` revert (no liquidity on the buy side) arms a persistent backoff (`price_limit_backoff_seconds`, doubling up to `_max_seconds`) and nothing is sent until it expires; other reverts send nothing and arm nothing; a filled purchase resets the backoff | gas only (ETH comes from the treasury's budgets) |
 
 Every paid command passes the daily ledger (`operator-state.json`): IMD per day, gas per day and
 request count per day. A refused step prints the reason and exits 1. Retries use linear backoff and
@@ -42,7 +45,9 @@ a fixed attempt cap; polling stops on the first terminal status.
 
 The Intake calls `OracleAdapter.onOracleResult` itself when the panel settles (status 0). If that
 callback is missed (out of gas, status 1/2, or a relayer outage) the same signed attestation can be
-submitted by anyone with `relay`; the signature is the proof, so relaying it is safe. After the
+submitted with `relay`: by anyone when it answers the adapter's own request (its `requestId` was
+registered by `request(roundId)`), otherwise only by the executor or the owner, so a third party cannot
+settle a round with an answer they bought themselves. After the
 result is stored, `Arena.settle(roundId)` is permissionless, and so are `claim`, `refund` and
 `cancel`. Players can always claim themselves; the operator may call these for convenience.
 

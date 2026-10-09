@@ -1,7 +1,10 @@
 # PRISM RIOT (PRIO) — Uniswap v4 hook launch on Ethereum
 
-Token **Prism Riot (PRIO)**, launch kind `univ4_hook`, pair ETH/PRIO, chain id 1. This repository is
-the contract project and the server operator for the launch. It contains no website.
+Token **Prism Riot (PRIO)**, pair ETH/PRIO, chain id 1. The token, hook, distributor and pool went live
+in launch 1153 (`univ4_hook`). This tree is the follow-up **contracts-only launch** (`evm_contracts`)
+that deploys the four application contracts: `FeeTreasury`, `StakingVault`, `Arena`, `OracleAdapter`.
+See `ADAPTATION.md` for every change made for it and `docs/DEPLOYMENT.md` for the verified live records,
+the manifest arguments and the owner's ordered configuration transactions. No website.
 
 | Contract (Solidity name) | Role |
 | --- | --- |
@@ -15,19 +18,22 @@ the contract project and the server operator for the launch. It contains no webs
 Everything is owned by the paying wallet through two-step ownership that cannot be renounced
 (`TwoStepOwned`). Active rules, reserved payouts and the 0.5% fee cannot be changed by anyone.
 
-## Status and honesty about deployment
+## Status (2026-10-09)
 
-- `forge build`, `forge test` (78 tests: unit, fuzz, invariant, deploy rehearsal) and
-  `forge fmt --check` pass with `solc = "0.8.26"`. The IMD protected floor tests for the token and the
-  hook were rehearsed locally against the built bytecode and pass (11/11). The independent reviewer's
-  four proof tests from the first review round pass on this tree (see `docs/REVIEW.md`, round 2).
-- **No contract has been deployed.** This assignment does not control a funded wallet or keys; the
-  IMD launch's manifest step deploys from the bytecode and records the addresses and receipts. The
-  prior attempt (job `bbf45a6b`) never broadcast a transaction, so there is nothing on chain to
-  duplicate. "Verified live addresses" therefore cannot be in this submission; they come from the
-  launch step after independent review. See `docs/REVIEW.md` for the review hand-off.
-- Independent review is required before release and is not something this job can perform on
-  itself; the reviewer's checklist and the finding-to-fix table are in `docs/REVIEW.md`.
+- **Live on Ethereum mainnet** (launch 1153, tx `0x545df1ad…6dd7d`, block 26154170): PRIO
+  `0xfd1c234972768c23bb21d655966e0b122dd67a2c`, `TreasuryFeeHook`
+  `0x65a783cc6725a02ce349dc4d72577994df1760cc` (owner `0x13afb9b5780cd9ae79c61503adb69c57845d8eac`,
+  `treasury()` still zero), distributor `0xd5873749535e5e558e3c2181ff8e9f43e4fc2927`, pool ETH/PRIO
+  fee 12500 / tick spacing 60. Verified by direct reads; see `docs/DEPLOYMENT.md` §1.
+- **Not yet deployed**: `FeeTreasury`, `StakingVault`, `Arena`, `OracleAdapter`. No application contract
+  exists on chain (owner wallet history and launch list checked), so this launch creates no duplicate.
+  Their addresses, receipts and `launch.json` come from the manifest and deployment steps; this
+  repository holds no keys and broadcasts nothing.
+- `forge build`, `forge test` (174 tests: unit, fuzz, invariant, deploy rehearsal, launch adaptation)
+  and `forge fmt` pass with `solc = "0.8.26"`; the protected floor test for `evm_contracts` was rehearsed
+  locally with the four built creation codes (1/1). `python3 operator/test_operator.py`: 9 tests.
+- Independent review is required before release; the finding-to-fix tables are in `docs/REVIEW.md`
+  (rounds 1-2) and `ADAPTATION.md` (the pre-launch audit of this tree).
 
 ## Build and test
 
@@ -42,16 +48,18 @@ Dependencies are vendored as ordinary files under `lib/` (forge-std, Uniswap v4-
 `test/utils/CurrencySettler.sol`, OpenZeppelin Contracts v5.1.0, three solmate files v4-core needs).
 No git submodules, no `ffi`, no filesystem permissions, no environment variables in tests.
 
-## Deployment parameters (for the manifest step)
+## Deployment parameters (for the manifest step of the contracts-only launch)
+
+Already live and **not** redeployed: `PrismRiotToken` (PRIO) and `TreasuryFeeHook` (addresses above).
+The four application contracts take static addresses; the brief names the owner, so it is written as
+that address rather than `$owner`.
 
 | Contract | Constructor arguments |
 | --- | --- |
-| `PrismRiotToken` | none |
-| `TreasuryFeeHook` | `IPoolManager poolManager` = `$poolManager`, `address token` = `$token`, `address factory` = `$factory`, `address owner` = `$owner` |
-| `FeeTreasury` | `IPoolManager poolManager` = `$poolManager`, `address owner` = `$owner` |
-| `StakingVault` | `address owner` = `$owner`, `address prio` = `$token` |
-| `Arena` | `address owner` = `$owner`, `address prio` = `$token` |
-| `OracleAdapter` | `address owner` = `$owner`, `address signer` = the IMD oracle signer on Ethereum, `0x5598aa9146215bc13eb26f2c692ad1461fd32982` (oracle-consumer skill, 2026-10-07); owner-rotatable with `setSigner` |
+| `FeeTreasury` | `IPoolManager poolManager` = `0x000000000004444c5dc75cb358380d2e3de08a90`, `address owner` = `0x13afb9b5780cd9ae79c61503adb69c57845d8eac` |
+| `StakingVault` | `address owner` = `0x13afb9b5780cd9ae79c61503adb69c57845d8eac`, `address prio` = `0xfd1c234972768c23bb21d655966e0b122dd67a2c` |
+| `Arena` | `address owner` = `0x13afb9b5780cd9ae79c61503adb69c57845d8eac`, `address prio` = `0xfd1c234972768c23bb21d655966e0b122dd67a2c` |
+| `OracleAdapter` | `address owner` = `0x13afb9b5780cd9ae79c61503adb69c57845d8eac`, `address signer` = `0x5598aa9146215bc13eb26f2c692ad1461fd32982`, the IMD oracle signer on Ethereum (re-verified 2026-10-09 against `api.imd.fun/oracle/requests`); owner-rotatable with `setSigner` for future pins |
 
 Hook address flags (mined by the deployer with CREATE2): `beforeInitialize | beforeSwap | afterSwap |
 beforeSwapReturnDelta | afterSwapReturnDelta` = `0x20CC` (8396). The constructor calls
@@ -64,27 +72,33 @@ dynamic-fee flag), `tickSpacing` = 60. The deployer opens the pool at the policy
 supply split (10% distributor, 87% pool, 3% payer) is the factory's; no contract here is allocated
 any of it.
 
-`script/Deploy.s.sol` is a reviewable rehearsal (`deployAll(Config)` mines a salt and deploys all six;
-`test/Deploy.t.sol` runs it). Its `run()` deliberately reverts: the launch deploys from the manifest.
+`script/Deploy.s.sol` is a reviewable rehearsal: `deployApplications(AppConfig)` deploys the four with the
+live addresses as inputs (`test/LaunchAdaptation.t.sol`), `deployAll(Config)` the original six
+(`test/Deploy.t.sol`). Its `run()` deliberately reverts: the launch deploys from the manifest.
+`script/ConfigPlan.s.sol` lists the owner's post-launch transactions in order (`docs/DEPLOYMENT.md` §3).
 
 ## After launch (owner settings)
 
-The paying wallet is the owner of all six contracts. Do these in order; each is an owner-only setter
-that emits an event, and every function that needs a value reverts with a clear error until it is set.
+The project owner `0x13afb9b5780cd9ae79c61503adb69c57845d8eac` owns all six contracts. Do these in order;
+each is an owner-only setter that emits an event, and every function that needs a value reverts with a
+clear error until it is set. Calldata for every step, and the simulation that executes the whole list
+against local copies of the live hook and PRIO, are in `docs/DEPLOYMENT.md` §3 and
+`script/ConfigPlan.s.sol`.
 
 | Step | Call | Value |
 | --- | --- | --- |
-| 1 | `FeeTreasury.bindHook(hook)` / `setPrio(token)` | the launched hook and token (one-time each) |
-| 2 | `TreasuryFeeHook.bindTreasury(treasury)` | the launched `FeeTreasury`, after step 1 (a treasury bound to another hook is refused). Correctable by the owner until the first fee has been delivered, immutable afterwards. Fees charged before binding wait in the hook and are flushed by anyone with `flush()` / `redeemClaims()` |
-| 3 | `StakingVault.setRewardFunder(treasury)` | the treasury, so `buyPrio` can stream rewards |
-| 4 | `Arena.setOracle(adapter)` | the launched `OracleAdapter` (applies to rounds created afterwards; a round keeps the adapter it was created with) |
-| 5 | `FeeTreasury.setSinks(vault, arena, adapter)` | the three launched contracts, one-time: the 30% PRIO / 30% IMD allocations cannot be redirected later |
-| 6 | `FeeTreasury.setExecutor(wallet)` / `OracleAdapter.setExecutor(wallet)` | the server operator's wallet |
-| 7 | `FeeTreasury.setReserveTarget(x)`, `setMaxSpendPerSwap(y)`, `setSpendPerWindow(z)` | reserve target default 0.5 ETH, hard cap 2 ETH; per-purchase cap default 1 ETH; per-rolling-day cap across both purchases, default 1 ETH |
-| 8 | `FeeTreasury.setPriceFloors(minPrioPerEth, minImdPerEth)` | **required before any purchase**: the minimum PRIO (resp. IMD) units per ETH a purchase must return, 18 decimals, e.g. 10% below the current pool price. The owner re-sets them when prices move; a floor above the market makes purchases revert, never overpay |
-| 9 | `FeeTreasury.setImd(0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7)` then `setImdPool(fee, tickSpacing, hooks)` | IMD on Ethereum (oracle-consumer skill) and the Uniswap v4 pool key where IMD trades against ETH (the owner finds it on the IMD explorer; ETH must be `currency0`). Calling `setImd` again unsets the pool key. Without it IMD purchases wait; PRIO purchases do not depend on it |
-| 10 | `OracleAdapter.setIntake(0x1397434cd35e8a9c8ac312a61d3a285eb31dea56)`, `setAction(bytes32("oracle.request@oracle-1"))`, `setPayment(IMD, 500000000000000000)`, `setCallbackConfigured(true)`, `setBudget(imdPerDay)` | the live Intake, action id, 0.5 IMD list price (read `Intake.priceOf`), the explicit callback switch, the executor's daily IMD budget |
-| 11 | per round: `OracleAdapter.pinQuestion(Arena.roundCount() + 1, questionHash, chainId, minPanel, minQuorum, commitDeadline, body)` **then** `Arena.createRound(...)` with the same `commitDeadline` | the question's canonical hash and compact body (oracle-consumer skill "The body"), chain the question is about, minimum panel/quorum, and the round's commit deadline as the clock boundary. `createRound` refuses a round whose question is not pinned at exactly that boundary, and records the adapter, the question hash and the signer pinned with it |
+| A1-A2 | `FeeTreasury.bindHook(0x65a783cc…60cc)` / `setPrio(0xfd1c2349…7a2c)` | the live hook and PRIO. Correctable until used (the hook until the first fee arrives, PRIO until the first purchase), immutable afterwards |
+| A3 | `FeeTreasury.setSinks(vault, arena, adapter)` | the three launched contracts. The vault and the arena must report PRIO as their token (`SinkMismatch` otherwise). Correctable until the first purchase; from then on the 30% PRIO / 30% IMD allocations cannot be redirected |
+| A4 | `TreasuryFeeHook.bindTreasury(treasury)` | the launched `FeeTreasury`, after A1-A3 (a treasury bound to another hook is refused). Correctable by the owner until the first fee has been delivered, **permanent afterwards**. Fees charged before binding wait in the hook and are flushed by anyone with `flush()` / `redeemClaims()` |
+| A5 | `StakingVault.setRewardFunder(treasury)` | the treasury, so `buyPrio` can stream rewards |
+| A6 | `Arena.setOracle(adapter)` | the launched `OracleAdapter` (applies to rounds created afterwards; a round keeps the adapter it was created with) |
+| A7 | `OracleAdapter.setArena(arena)` | the launched `Arena`, so a mistaken pin for a round the Arena has not created yet can be replaced |
+| B1-B4 | `FeeTreasury.setReserveTarget(x)`, `setMaxSpendPerSwap(y)`, `setSpendPerWindow(z)`, `setReservePerWindow(r)` | reserve target default 0.5 ETH, hard cap 2 ETH; per-purchase cap default 1 ETH; per-24h-bucket cap across both purchases, default 1 ETH (**fixed bucket**: at most 2× in any 24h span); executor gas draw per bucket, to the executor only, default 0.05 ETH |
+| B5 | `FeeTreasury.setPriceFloors(minPrioPerEth, minImdPerEth)` | **required before any purchase**: the minimum PRIO (resp. IMD) units per ETH a purchase must return, 18 decimals, e.g. 10% below the current pool price. The owner re-sets them when prices move; a floor above the market makes purchases revert, never overpay |
+| B6-B7 | `FeeTreasury.setImd(0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7)` then `setImdPool(fee, tickSpacing, hooks)` | IMD on Ethereum and the Uniswap v4 pool key where IMD trades against ETH (ETH must be `currency0`; the pool with liquidity on 2026-10-09 was fee 10000 / tick spacing 200 / no hook, see `docs/DEPLOYMENT.md` §4). Calling `setImd` again unsets the pool key. Without it IMD purchases wait; PRIO purchases do not depend on it |
+| B8-B12 | `OracleAdapter.setIntake(0x1397434cd35e8a9c8ac312a61d3a285eb31dea56)`, `setAction(bytes32("oracle.request@oracle-1"))`, `setPayment(IMD, 500000000000000000)`, `setCallbackConfigured(true)`, `setBudget(imdPerDay)` | the live Intake, action id, 0.5 IMD list price (read `Intake.priceOf`), the explicit callback switch, the executor's daily IMD budget |
+| B13 | `FeeTreasury.setExecutor(wallet)` / `OracleAdapter.setExecutor(wallet)` | the server operator's wallet, last: nothing is spendable by it before every limit is in place |
+| per round | `OracleAdapter.pinQuestion(Arena.roundCount() + 1, questionHash, chainId, minPanel, minQuorum, commitDeadline, body)` **then** `Arena.createRound(...)` with the same `commitDeadline` | the question's canonical hash and compact body (oracle-consumer skill "The body"), chain the question is about, minimum panel/quorum, and the round's commit deadline as the clock boundary. `createRound` refuses a round whose question is not pinned at exactly that boundary, and records the adapter, the question hash and the signer pinned with it |
 
 ## The hook
 
@@ -169,9 +183,11 @@ tests (mined flags, callback refusal, initialization from the factory probe, no 
   rest goes 30% `imdBudget`, 30% `prioBudget`, 40% `ownerBudget`. Reserve target default 0.5 ETH, hard
   cap `MAX_RESERVE_TARGET = 2 ETH`: a finite, documented reserve.
 - `withdrawReserve` (owner or executor) pays the operator wallet's gas from the reserve only: the
-  fee-funded gas bootstrap. `withdrawOwner` is capped by `ownerBudget`.
+  fee-funded gas bootstrap. The executor may draw it only to its own address and at most
+  `reservePerWindow` per 24h bucket; the owner is unrestricted. `withdrawOwner` is capped by `ownerBudget`.
 - `buyPrio(ethIn, minOut)` (executor): bounded by `prioBudget`, `maxSpendPerSwap` per call and
-  `spendPerWindow` per rolling day (shared with `buyImd`), swaps ETH→PRIO on the hooked pool through
+  `spendPerWindow` per 24h bucket (shared with `buyImd`; a fixed bucket, so at most 2× `spendPerWindow`
+  in any 24h span), swaps ETH→PRIO on the hooked pool through
   the PoolManager (paying the 0.5% back to itself), checks `minOut` **and** the owner's `minPrioPerEth`
   floor on the ETH actually spent, then sends half to `StakingVault.notifyReward` and half to
   `Arena.fundPrizes`. Works with no IMD configuration. If the pool fills only part of `ethIn`, only the
@@ -181,7 +197,8 @@ tests (mined flags, callback refusal, initialization from the factory probe, no 
   owner-set IMD pool (whose `currency1` must be the configured IMD), output to the `OracleAdapter`.
 - Swaps are executor-gated because a permissionless swap with a caller-chosen `minOut` would be a
   sandwich target; the window cap and price floors bound what a stolen executor key can do (at most
-  `spendPerWindow` per day, never below the floor); allocation, flushing and claims are permissionless.
+  2 × `spendPerWindow` in any 24h span, never below the floor, reserve draws only to itself within
+  `reservePerWindow`); allocation, flushing and claims are permissionless.
 
 ## StakingVault
 
@@ -258,20 +275,26 @@ check), question hash and chain match, `panelSize ≥ minPanel`, `quorum ≥ min
 carries the answer and the evidence reference (request id, panel job id, block window and hash).
 
 Two paths in: the Intake's callback `onOracleResult` (only from the configured intake, only for a
-request this contract made, under the 200 000 gas stipend, tested) and the permissionless manual
-relay `submitAttestation`. Paid requests (`request(roundId)`, executor only) are disabled until
-intake, action, asset+price, callback switch, executor and budget are set and the contract holds IMD,
-and refused before the round's `notBefore` (an answer bought while commitments are open could leak or
-be wasted); `clearStale` forgets a request after 2 days (a refused or non-agreeing panel never calls
-back and the price is spent). `withdrawToken` returns stray tokens but never the configured payment
+request this contract made, under the 200 000 gas stipend, tested) and the manual relay
+`submitAttestation`. Because the pinned question is public and the oracle sells answers to anyone, a
+relay from an arbitrary address is accepted only when the attestation answers this adapter's own request
+(`requestId` registered by `request()`); any other attestation may be relayed only by the executor or
+the owner, so nobody can buy competing answers and front-run the operator. One paid request per round
+is open at a time (`RequestPending`). Paid requests (`request(roundId)`, executor only) are disabled
+until intake, action, asset+price, callback switch, executor and budget are set and the contract holds
+IMD, and refused before the round's `notBefore` (an answer bought while commitments are open could leak
+or be wasted); `clearStale` forgets a request after 2 days (a refused or non-agreeing panel never calls
+back and the price is spent). A pin can be replaced only while the Arena named with `setArena` has not
+created the round, nothing is settled and no request is open; afterwards it is immutable. `withdrawToken` returns stray tokens but never the configured payment
 asset: the IMD bought for agent work stays for panel answers.
 
 ## Server operator
 
 See `docs/OPERATOR.md`. `operator/operator.py` (stdlib only) does capabilities / check / quote /
-payment / polling / retries / result relay / proposals, with daily IMD, gas and request caps and a
-`paid_operations_enabled` switch that stays off until configuration and fee funding are done. Keys
-stay server-side. Agent outputs are proposals only.
+payment / polling / retries / result relay / proposals / treasury purchases, with daily IMD, gas and
+request caps, a simulate-first purchase path that backs off on `PriceLimitAlreadyExceeded` instead of
+re-sending, and a `paid_operations_enabled` switch that stays off until configuration and fee funding
+are done. Keys stay server-side. Agent outputs are proposals only.
 
 ## What the brief asked that the token does not do
 
@@ -302,7 +325,8 @@ these can reach staking principal, Arena escrow, locked prizes or an open round.
 
 ```
 src/            contracts            test/      Foundry tests (+ utils/Fixture.sol, utils/MockIntake.sol)
-script/         Deploy.s.sol         docs/abi/  ABIs        docs/OPERATOR.md  docs/REVIEW.md
+script/         Deploy.s.sol, ConfigPlan.s.sol    docs/abi/  ABIs    docs/DEPLOYMENT.md  docs/OPERATOR.md  docs/REVIEW.md
+ADAPTATION.md   every change made for the contracts-only launch and why
 operator/       operator.py, test_operator.py, operator.example.json
 lib/            vendored dependencies
 ```

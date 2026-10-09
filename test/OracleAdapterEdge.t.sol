@@ -85,9 +85,11 @@ contract OracleAdapterEdgeTest is Test {
         bytes memory sig = signWith(SIGNER_KEY, a);
         uint64 issued = a.issuedAt;
         vm.expectRevert(abi.encodeWithSelector(ConsumerErrors.AttestationNotYetValid.selector, issued));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         a.issuedAt = uint64(block.timestamp) + 5 minutes;
         sig = signWith(SIGNER_KEY, a);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         assertTrue(adapter.resultOf(1).settled);
     }
@@ -96,6 +98,7 @@ contract OracleAdapterEdgeTest is Test {
         OracleAttestation.Attestation memory a = att(1);
         bytes memory sig = signWith(SIGNER_KEY, a);
         vm.warp(a.expiresAt);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         assertTrue(adapter.resultOf(1).settled);
     }
@@ -106,14 +109,18 @@ contract OracleAdapterEdgeTest is Test {
         OracleAttestation.Attestation memory a = att(1);
         bytes memory wrongKey = signWith(OTHER_KEY, a);
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, wrongKey);
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, hex"");
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, hex"deadbeef");
         bytes memory sig = signWith(SIGNER_KEY, a);
         sig[0] = bytes1(uint8(sig[0]) ^ 0xff);
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
         assertFalse(adapter.resultOf(1).settled);
     }
@@ -138,7 +145,9 @@ contract OracleAdapterEdgeTest is Test {
         bytes memory aByNew = signWith(OTHER_KEY, a);
         bytes memory aByOld = signWith(SIGNER_KEY, a);
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, aByNew);
+        vm.prank(owner);
         adapter.submitAttestation(1, a, aByOld);
         assertTrue(adapter.resultOf(1).settled);
 
@@ -150,7 +159,9 @@ contract OracleAdapterEdgeTest is Test {
         bytes memory bByOld = signWith(SIGNER_KEY, b);
         bytes memory bByNew = signWith(OTHER_KEY, b);
         vm.expectRevert(ConsumerErrors.BadSignature.selector);
+        vm.prank(owner);
         adapter.submitAttestation(2, b, bByOld);
+        vm.prank(owner);
         adapter.submitAttestation(2, b, bByNew);
         assertTrue(adapter.resultOf(2).settled);
     }
@@ -167,9 +178,11 @@ contract OracleAdapterEdgeTest is Test {
         bytes memory sig = signWith(SIGNER_KEY, a);
         vm.warp(notBefore - 1);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.BeforeBoundary.selector, notBefore));
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
         assertFalse(adapter.resultOf(2).settled);
         vm.warp(notBefore);
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
         assertTrue(adapter.resultOf(2).settled);
     }
@@ -198,8 +211,10 @@ contract OracleAdapterEdgeTest is Test {
         adapter.pinQuestion(2, QUESTION, 1, 5, 4, T0 - 1 hours, "");
         OracleAttestation.Attestation memory a = att(1);
         bytes memory sig = signWith(SIGNER_KEY, a);
+        vm.prank(owner);
         adapter.submitAttestation(2, a, sig);
         vm.expectRevert(abi.encodeWithSelector(ConsumerErrors.AlreadyConsumed.selector, a.requestId));
+        vm.prank(owner);
         adapter.submitAttestation(1, a, sig);
     }
 
@@ -292,7 +307,9 @@ contract OracleAdapterEdgeTest is Test {
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.QuestionNotPinned.selector, 7));
         adapter.request(7);
         OracleAttestation.Attestation memory a = att(1);
-        adapter.submitAttestation(1, a, signWith(SIGNER_KEY, a));
+        bytes memory sig = signWith(SIGNER_KEY, a);
+        vm.prank(owner);
+        adapter.submitAttestation(1, a, sig);
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(OracleAdapter.AlreadySettled.selector, 1));
         adapter.request(1);
@@ -306,7 +323,9 @@ contract OracleAdapterEdgeTest is Test {
         vm.prank(executor);
         bytes32 id = adapter.request(1);
         OracleAttestation.Attestation memory manual = att(3);
-        adapter.submitAttestation(1, manual, signWith(SIGNER_KEY, manual));
+        bytes memory manualSig = signWith(SIGNER_KEY, manual);
+        vm.prank(owner);
+        adapter.submitAttestation(1, manual, manualSig);
         OracleAttestation.Attestation memory late = att(9);
         bool ok = intake.deliver(abi.encode(id, late, signWith(SIGNER_KEY, late)));
         assertFalse(ok, "the callback reverts: round already settled");
@@ -339,17 +358,21 @@ contract OracleAdapterEdgeTest is Test {
     function test_budgetWindowBoundary() public {
         configurePaid();
         imd.transfer(address(adapter), 5 ether);
+        vm.startPrank(owner);
+        adapter.pinQuestion(2, QUESTION, 1, 5, 4, T0 - 1 hours, "");
+        adapter.pinQuestion(3, QUESTION, 1, 5, 4, T0 - 1 hours, "");
+        vm.stopPrank();
         vm.startPrank(executor);
         adapter.request(1);
         uint256 start = adapter.windowStart();
-        adapter.request(1);
+        adapter.request(2);
         vm.expectRevert(OracleAdapter.BudgetExceeded.selector);
-        adapter.request(1);
+        adapter.request(3);
         vm.warp(start + 1 days - 1);
         vm.expectRevert(OracleAdapter.BudgetExceeded.selector);
-        adapter.request(1);
+        adapter.request(3);
         vm.warp(start + 1 days);
-        adapter.request(1);
+        adapter.request(3);
         assertEq(adapter.spentInWindow(), 0.5 ether);
         vm.stopPrank();
         assertEq(imd.balanceOf(address(intake)), 1.5 ether, "every request paid the price");

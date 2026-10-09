@@ -65,13 +65,19 @@ outer remainder swap legal on a partial fill. Delta accounting stays zero for th
 | 12 | fuzz | quote identity and fee conservation fuzzed |
 | 13 | invariants | vault and arena accounting invariants run under a handler |
 
+## Round 3: the pre-launch audit of this tree (contracts-only launch)
+
+Seven findings (one medium manifest finding, one medium adapter finding, four low, one info). Each was
+reproduced before it was fixed; the change list, tests and the verified live records are in
+`ADAPTATION.md` and `docs/DEPLOYMENT.md`.
+
 ## Known limitations and open items
 
 - **Independent review before deployment** is required by the brief and is not something this job
   can perform on itself. This document is the hand-off for that reviewer.
-- **Mainnet deployment and receipts**: this assignment does not control a funded wallet; the IMD
-  launch step deploys from the manifest and records the addresses. No prior deployment exists to
-  avoid duplicating (the prior job was blocked before broadcasting).
+- **Mainnet deployment and receipts**: the token, hook and distributor are live (launch 1153); the four
+  application contracts are deployed by the contracts-only launch from the manifest, which records the
+  addresses. No application contract exists yet (checked 2026-10-09), so nothing is duplicated.
 - **Slither/Mythril** were not available offline; `forge build`'s lints were reviewed (all are
   informational: timestamp comparisons that the design needs, events after the external calls that
   produce them).

@@ -24,6 +24,73 @@ class FakeResponse(io.BytesIO):
         return False
 
 
+class PurchaseBackoffTests(unittest.TestCase):
+    """PriceLimitAlreadyExceeded: back off until liquidity returns instead of re-sending on a timer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = op.load_config(Path(self.tmp.name) / "none.json")
+        self.cfg["paid_operations_enabled"] = True
+        self.cfg["contracts"]["oracle_adapter"] = "0x" + "11" * 20
+        self.cfg["contracts"]["fee_treasury"] = "0x" + "22" * 20
+        self.budget = op.Budget(self.cfg, Path(self.tmp.name) / "state.json")
+        self.backoff = op.Backoff(self.cfg, Path(self.tmp.name) / "backoff.json")
+        self.sent = []
+
+    def caller(self, revert_text=None):
+        def run(args, cfg, send=False, dry_run=False):
+            if send:
+                self.sent.append(args)
+                return "0xtx"
+            if revert_text is not None:
+                raise op.subprocess.CalledProcessError(1, ["cast"], output="", stderr=revert_text)
+            return "0x"
+        return run
+
+    def test_price_limit_revert_arms_backoff_and_doubles(self):
+        now = 1_000_000
+        text = "Error: server returned an error response: execution reverted, data: \"0x7c9c6e8f...\" PriceLimitAlreadyExceeded"
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(text))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["backoff_seconds"], 3600)
+        self.assertEqual(self.sent, [], "nothing is broadcast when the simulation reverts")
+        # Inside the window: refused without even simulating.
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now + 10, caller=self.caller(text))
+        self.assertIn("backing off", out["reason"])
+        # After the window, still no liquidity: the wait doubles, capped at the maximum.
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now + 3601, caller=self.caller(text))
+        self.assertEqual(out["backoff_seconds"], 7200)
+        for _ in range(8):
+            now += 100_000
+            out = op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", False, now=lambda: now, caller=self.caller(text))
+        self.assertEqual(out["backoff_seconds"], 86400)
+        # IMD purchases have their own backoff.
+        blocked, _ = self.backoff.blocked("imd", now)
+        self.assertFalse(blocked)
+
+    def test_success_clears_backoff_and_other_reverts_do_not_arm_it(self):
+        now = 1_000_000
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "imd", False, now=lambda: now, caller=self.caller("Slippage()"))
+        self.assertFalse(out["ok"])
+        self.assertNotIn("backoff_seconds", out)
+        self.assertFalse(self.backoff.blocked("imd", now)[0])
+        self.backoff.hit("imd", now)
+        now += 90_000
+        out = op.cmd_buy(self.cfg, self.budget, self.backoff, "imd", False, now=lambda: now, caller=self.caller())
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertFalse(self.backoff.blocked("imd", now)[0], "a filled purchase resets the streak")
+
+    def test_disabled_switch_and_missing_treasury(self):
+        self.cfg["paid_operations_enabled"] = False
+        with self.assertRaises(SystemExit):
+            op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", True)
+        self.cfg["paid_operations_enabled"] = True
+        self.cfg["contracts"]["fee_treasury"] = ""
+        with self.assertRaises(SystemExit):
+            op.cmd_buy(self.cfg, self.budget, self.backoff, "prio", True)
+
+
 class BudgetTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

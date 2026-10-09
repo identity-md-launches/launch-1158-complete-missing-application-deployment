@@ -8,6 +8,7 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 import {FeeTreasury} from "../src/FeeTreasury.sol";
 import {StakingVault} from "../src/StakingVault.sol";
+import {PrismRiotToken} from "../src/PrismRiotToken.sol";
 import {Arena} from "../src/Arena.sol";
 
 contract FeeTreasuryTest is Fixture {
@@ -80,7 +81,7 @@ contract FeeTreasuryTest is Fixture {
     }
 
     function test_ownerAndReserveWithdrawalsAreCapped() public {
-        earn(100 ether);
+        earn(200 ether);
         treasury.allocate();
         uint256 ownerBudget = treasury.ownerBudget();
         address payable sink = payable(makeAddr("sink"));
@@ -91,12 +92,38 @@ contract FeeTreasuryTest is Fixture {
         treasury.withdrawOwner(sink, ownerBudget);
         assertEq(sink.balance, ownerBudget);
         uint256 reserve = treasury.reserve();
+        uint256 perWindow = treasury.reservePerWindow();
+        assertGt(reserve, perWindow);
+        // Finding aac12d4e: the executor draws only to itself and only `reservePerWindow` per bucket.
         vm.prank(executor);
-        treasury.withdrawReserve(sink, reserve);
-        assertEq(sink.balance, ownerBudget + reserve);
+        vm.expectRevert(FeeTreasury.WrongDestination.selector);
+        treasury.withdrawReserve(sink, 1);
+        vm.prank(executor);
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.withdrawReserve(payable(executor), perWindow + 1);
+        vm.prank(executor);
+        treasury.withdrawReserve(payable(executor), perWindow);
+        assertEq(executor.balance, perWindow);
+        vm.prank(executor);
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.withdrawReserve(payable(executor), 1);
+        skip(1 days);
+        vm.prank(executor);
+        treasury.withdrawReserve(payable(executor), 1);
+        // The owner is not rate-limited and may send the reserve anywhere.
+        uint256 rest = treasury.reserve();
+        vm.prank(owner);
+        treasury.withdrawReserve(sink, rest);
+        assertEq(treasury.reserve(), 0);
         vm.prank(trader);
         vm.expectRevert(FeeTreasury.NotExecutor.selector);
         treasury.withdrawReserve(sink, 1);
+        vm.prank(owner);
+        treasury.setReservePerWindow(0);
+        skip(1 days);
+        vm.prank(executor);
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.withdrawReserve(payable(executor), 1);
     }
 
     function test_buyPrioSplitsBetweenStakingAndArena() public {
@@ -196,14 +223,82 @@ contract FeeTreasuryTest is Fixture {
         assertLt(treasury.spentInWindow(), 1 ether, "the window counts what was spent");
     }
 
-    function test_sinksAreSetOnceAndNonZero() public {
+    /// @dev Finding 0cd78a87: a wrong sink used to be permanent from the first call. Sinks are checked against
+    /// PRIO and stay correctable until the first purchase; from then on they are frozen.
+    function test_sinksAreCheckedAndCorrectableUntilFirstPurchase_thenFrozen() public {
         FeeTreasury fresh = new FeeTreasury(IPoolManager(address(manager)), owner);
         vm.startPrank(owner);
         vm.expectRevert(FeeTreasury.ZeroAddress.selector);
         fresh.setSinks(address(0), address(arena), adapterAddr);
+        vm.expectRevert(abi.encodeWithSelector(FeeTreasury.NotConfigured.selector, "prio"));
         fresh.setSinks(address(vault), address(arena), adapterAddr);
+        fresh.setPrio(address(token));
+        // Swapped vault/arena still report PRIO, but a vault for another token or a plain address is refused.
+        StakingVault foreign = new StakingVault(owner, address(new PrismRiotToken()));
+        vm.expectRevert(FeeTreasury.SinkMismatch.selector);
+        fresh.setSinks(address(foreign), address(arena), adapterAddr);
+        vm.expectRevert();
+        fresh.setSinks(adapterAddr, address(arena), adapterAddr);
+        fresh.setSinks(address(arena), address(vault), adapterAddr); // swapped: passes the token check
+        fresh.setSinks(address(vault), address(arena), adapterAddr); // and can be corrected
+        assertEq(fresh.stakingVault(), address(vault));
+        fresh.setPrio(address(token)); // PRIO too, before any purchase
+        vm.stopPrank();
+        // The fixture treasury has bought: nothing can be redirected any more.
+        earn(100 ether);
+        treasury.allocate();
+        vm.prank(executor);
+        treasury.buyPrio(0.1 ether, 0);
+        assertTrue(treasury.purchased());
+        vm.startPrank(owner);
         vm.expectRevert(FeeTreasury.AlreadySet.selector);
-        fresh.setSinks(address(vault), address(arena), adapterAddr);
+        treasury.setSinks(address(vault), address(arena), adapterAddr);
+        vm.expectRevert(FeeTreasury.AlreadySet.selector);
+        treasury.setPrio(address(token));
+        vm.stopPrank();
+    }
+
+    /// @dev Finding 0cd78a87 (hook side): a wrong hook address can be corrected until the first fee arrives.
+    function test_hookBindingIsCorrectableUntilFirstIncome() public {
+        FeeTreasury fresh = new FeeTreasury(IPoolManager(address(manager)), owner);
+        vm.startPrank(owner);
+        fresh.bindHook(address(0xBEEF));
+        fresh.bindHook(address(hook));
+        assertEq(fresh.hook(), address(hook));
+        vm.stopPrank();
+        // The fixture treasury receives a fee: its hook is frozen.
+        earn(1 ether);
+        assertGt(treasury.totalIncome(), 0);
+        vm.prank(owner);
+        vm.expectRevert(FeeTreasury.HookAlreadyBound.selector);
+        treasury.bindHook(address(0xBEEF));
+    }
+
+    /// @dev Finding e06da50e: the window is a fixed bucket. This pins the documented bound: at most
+    /// 2 x spendPerWindow can leave in one 24-hour span, and never more.
+    function test_spendWindowIsAFixedBucket_atMostTwiceThePerWindowCapInAnyDay() public {
+        vm.deal(trader, 5_000 ether);
+        earn(2_000 ether);
+        treasury.allocate();
+        vm.startPrank(owner);
+        treasury.setMaxSpendPerSwap(1 ether);
+        treasury.setSpendPerWindow(1 ether);
+        treasury.setPriceFloors(1, 1); // the large test buy moves the 1:1 pool; only the window is under test
+        vm.stopPrank();
+        vm.startPrank(executor);
+        treasury.buyPrio(0.4 ether, 0);
+        uint256 start = treasury.windowStart();
+        vm.warp(start + 1 days - 1);
+        treasury.buyPrio(0.6 ether, 0);
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.buyPrio(1, 0);
+        vm.warp(start + 1 days);
+        treasury.buyPrio(1 ether, 0); // the next bucket: 2 ETH within two seconds, the documented maximum
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.buyPrio(1, 0);
+        vm.warp(start + 2 days - 1);
+        vm.expectRevert(FeeTreasury.ExceedsWindow.selector);
+        treasury.buyPrio(1, 0);
         vm.stopPrank();
     }
 

@@ -156,6 +156,7 @@ contract ArenaHandler is Test {
                 expiresAt: uint64(block.timestamp + 1 days)
             });
             (uint8 v, bytes32 rr, bytes32 s) = vm.sign(SIGNER_KEY, adapter.attestationDigest(a));
+            vm.prank(owner);
             adapter.submitAttestation(id, a, abi.encodePacked(rr, s, v));
         }
         arena.settle(id);

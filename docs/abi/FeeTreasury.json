@@ -435,6 +435,19 @@
   },
   {
     "type": "function",
+    "name": "purchased",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
@@ -455,7 +468,46 @@
   },
   {
     "type": "function",
+    "name": "reservePerWindow",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "reserveSpentInWindow",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "reserveTarget",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "reserveWindowStart",
     "inputs": [],
     "outputs": [
       {
@@ -554,6 +606,19 @@
         "name": "prio_",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setReservePerWindow",
+    "inputs": [
+      {
+        "name": "perWindow",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],
@@ -1034,6 +1099,19 @@
   },
   {
     "type": "event",
+    "name": "ReservePerWindowSet",
+    "inputs": [
+      {
+        "name": "perWindow",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "ReserveTargetSet",
     "inputs": [
       {
@@ -1203,6 +1281,11 @@
   },
   {
     "type": "error",
+    "name": "SinkMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "Slippage",
     "inputs": []
   },
@@ -1214,6 +1297,11 @@
   {
     "type": "error",
     "name": "TransferFailed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "WrongDestination",
     "inputs": []
   },
   {

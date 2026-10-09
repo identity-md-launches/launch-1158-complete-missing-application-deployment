@@ -15,5 +15,12 @@
     "oracle_price_imd": "500000000000000000"
   },
   "poll": { "interval_seconds": 30, "max_attempts": 120 },
-  "retries": { "attempts": 3, "backoff_seconds": 5 }
+  "retries": { "attempts": 3, "backoff_seconds": 5 },
+  "executor_address": "",
+  "purchases": {
+    "eth_per_buy": "100000000000000000",
+    "min_out_bps_of_floor": 10000,
+    "price_limit_backoff_seconds": 3600,
+    "price_limit_backoff_max_seconds": 86400
+  }
 }

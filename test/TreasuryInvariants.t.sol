@@ -129,13 +129,21 @@ contract TreasuryHandler is Test {
         ghostOwnerOut += amount;
     }
 
+    /// @dev The handler is the executor: it may draw the reserve only to itself, `reservePerWindow` per bucket.
     function withdrawReserve(uint256 amount) external {
         uint256 max = treasury.reserve();
         if (max == 0) return;
-        amount = bound(amount, 1, max);
-        treasury.withdrawReserve(sink, amount);
+        uint256 room = treasury.reservePerWindow();
+        if (block.timestamp < treasury.reserveWindowStart() + treasury.SPEND_WINDOW()) {
+            room -= treasury.reserveSpentInWindow();
+        }
+        if (room == 0) return;
+        amount = bound(amount, 1, max < room ? max : room);
+        treasury.withdrawReserve(payable(address(this)), amount);
         ghostReserveOut += amount;
     }
+
+    receive() external payable {}
 
     function buyPrio(uint256 amount) external {
         uint256 max = treasury.prioBudget();

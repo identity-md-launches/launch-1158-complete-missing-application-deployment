@@ -32,6 +32,22 @@ contract DeployScript is Script {
         OracleAdapter adapter;
     }
 
+    /// @notice The contracts-only launch (2026-10-09): the token, hook and pool are already live; only these
+    /// four are deployed, each with two static constructor arguments (see docs/DEPLOYMENT.md).
+    struct AppConfig {
+        IPoolManager poolManager; // live PoolManager
+        address owner; // live project owner
+        address prio; // live PRIO
+        address oracleSigner; // current IMD oracle signer
+    }
+
+    struct Applications {
+        FeeTreasury treasury;
+        StakingVault vault;
+        Arena arena;
+        OracleAdapter adapter;
+    }
+
     uint160 public constant HOOK_FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
 
@@ -57,6 +73,15 @@ contract DeployScript is Script {
         d.treasury = new FeeTreasury(c.poolManager, c.owner);
         d.vault = new StakingVault(c.owner, address(d.token));
         d.arena = new Arena(c.owner, address(d.token));
+        d.adapter = new OracleAdapter(c.owner, c.oracleSigner);
+    }
+
+    /// @notice Deploys only the four application contracts, exactly as the contracts-only factory does: plain
+    /// constructors, static arguments, no call to any other contract.
+    function deployApplications(AppConfig memory c) public returns (Applications memory d) {
+        d.treasury = new FeeTreasury(c.poolManager, c.owner);
+        d.vault = new StakingVault(c.owner, c.prio);
+        d.arena = new Arena(c.owner, c.prio);
         d.adapter = new OracleAdapter(c.owner, c.oracleSigner);
     }
 

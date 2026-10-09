@@ -7,6 +7,11 @@ import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/Signa
 import {OracleAttestation, OracleAttestationConsumer} from "./OracleAttestation.sol";
 import {TwoStepOwned} from "./TwoStepOwned.sol";
 
+/// @notice What the adapter reads from the Arena: the last round id it has created.
+interface IArenaRounds {
+    function roundCount() external view returns (uint256);
+}
+
 /// @notice The IdentityMD Intake, as this contract calls it (oracle-consumer skill).
 interface IIntake {
     struct Callback {
@@ -34,10 +39,19 @@ interface IIntake {
 /// evidence reference (request id, panel job id, block window and hash) are stored; the Arena reads them.
 ///
 /// Two ways in: the Intake's own callback after a paid `oracle.request` made by `request()`, and
-/// `submitAttestation()`, a permissionless manual relay for the same signed attestation (keys stay with the
-/// oracle; relaying one is harmless because the signature is the proof). Paid requests are disabled until
-/// the owner has configured the intake, action, asset, price and callback, pinned the round's question, set
-/// an executor, set a budget, and the contract holds IMD bought by the treasury from earned fees.
+/// `submitAttestation()`, a manual relay for a signed attestation. The question body is public once pinned
+/// and the oracle sells answers to anyone, so a relay is accepted from anyone only when the attestation
+/// answers a request this contract made for that round (`requestId` registered by `request()`); any other
+/// attestation (one bought off chain by the operator through the HTTP door, or one bought by a third party)
+/// may be relayed only by the executor or the owner. That way a player cannot buy competing answers until
+/// one suits them and front-run the operator. One paid request per round is open at a time: a second
+/// `request()` for the same round is refused until the first is answered or cleared as stale.
+///
+/// Paid requests are disabled until the owner has configured the intake, action, asset, price and callback,
+/// pinned the round's question, set an executor, set a budget, and the contract holds IMD bought by the
+/// treasury from earned fees. A pin is immutable once the Arena has created its round; before that (and
+/// only when the owner has told this adapter which Arena to check with `setArena`) a mistaken pin can be
+/// replaced, so a wrong `notBefore` cannot block round creation forever.
 contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     using SafeERC20 for IERC20;
 
@@ -77,17 +91,22 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     uint256 public budgetPerWindow;
     uint256 public windowStart;
     uint256 public spentInWindow;
+    /// @notice The Arena whose `roundCount` tells which pins are already consumed (re-pin guard).
+    address public arena;
 
     mapping(uint256 roundId => Pinned) internal _pinned;
     mapping(uint256 roundId => Result) internal _results;
     mapping(bytes32 intakeId => uint256 roundId) public pendingRound;
     mapping(bytes32 intakeId => uint256) public pendingSince;
+    /// @notice The intake request currently open for a round (zero when none).
+    mapping(uint256 roundId => bytes32 intakeId) public openRequest;
 
     event IntakeSet(address indexed intake);
     event ActionSet(bytes32 indexed action);
     event PaymentSet(address indexed asset, uint256 price);
     event CallbackConfigured(bool configured);
     event ExecutorSet(address indexed executor);
+    event ArenaSet(address indexed arena);
     event BudgetSet(uint256 budgetPerWindow);
     event QuestionPinned(uint256 indexed roundId, bytes32 questionHash, uint256 chainId, uint64 notBefore);
     event Requested(uint256 indexed roundId, bytes32 indexed intakeId, uint256 paid);
@@ -112,6 +131,8 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
     error ZeroAddress();
     error AlreadyPinned(uint256 roundId);
     error AssetNotWithdrawable();
+    error RequestPending(uint256 roundId);
+    error NotRelayer();
 
     constructor(address owner_, address signer_) OracleAttestationConsumer(signer_) TwoStepOwned(owner_) {}
 
@@ -147,6 +168,13 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         emit ExecutorSet(to);
     }
 
+    /// @notice The Arena this adapter serves, so a pin for a round it has not created yet can be corrected.
+    function setArena(address to) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        arena = to;
+        emit ArenaSet(to);
+    }
+
     /// @notice IMD the executor may spend per `BUDGET_WINDOW`.
     function setBudget(uint256 perWindow) external onlyOwner {
         budgetPerWindow = perWindow;
@@ -158,7 +186,9 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         _setOracleSigner(to);
     }
 
-    /// @notice Pins a round's question before it opens, with the current trusted signer. Immutable once pinned.
+    /// @notice Pins a round's question before it opens, with the current trusted signer. A pin can be replaced
+    /// only while nothing depends on it: the Arena set with `setArena` has not created the round yet, no result
+    /// is stored and no paid request is open. Once the Arena has created the round the pin is immutable.
     function pinQuestion(
         uint256 roundId,
         bytes32 questionHash,
@@ -168,10 +198,19 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         uint64 notBefore,
         bytes calldata body
     ) external onlyOwner {
-        if (_pinned[roundId].questionHash != bytes32(0)) revert AlreadyPinned(roundId);
+        if (_pinned[roundId].questionHash != bytes32(0) && !_replaceable(roundId)) {
+            revert AlreadyPinned(roundId);
+        }
         if (questionHash == bytes32(0) || minQuorum < 2 || minPanel < minQuorum) revert NotConfigured("question");
         _pinned[roundId] = Pinned(questionHash, chainId, minPanel, minQuorum, notBefore, oracleSigner, body);
         emit QuestionPinned(roundId, questionHash, chainId, notBefore);
+    }
+
+    /// @dev A pin may be replaced only when the configured Arena has not consumed the id, nothing is settled
+    /// and no request is open for it.
+    function _replaceable(uint256 roundId) internal view returns (bool) {
+        if (arena == address(0) || _results[roundId].settled || openRequest[roundId] != bytes32(0)) return false;
+        return IArenaRounds(arena).roundCount() < roundId;
     }
 
     // ------------------------------------------------------------------ views
@@ -199,6 +238,7 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         Pinned storage p = _pinned[roundId];
         if (p.questionHash == bytes32(0)) revert QuestionNotPinned(roundId);
         if (_results[roundId].settled) revert AlreadySettled(roundId);
+        if (openRequest[roundId] != bytes32(0)) revert RequestPending(roundId);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.notBefore) revert BeforeBoundary(p.notBefore);
         if (block.timestamp >= windowStart + BUDGET_WINDOW) {
@@ -210,8 +250,10 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         IERC20(asset).forceApprove(address(intake), price);
         intakeId =
             intake.request(action, p.body, IIntake.Callback(address(this), this.onOracleResult.selector), asset, price);
+        if (intakeId == bytes32(0) || pendingSince[intakeId] != 0) revert UnknownRequest();
         pendingRound[intakeId] = roundId;
         pendingSince[intakeId] = block.timestamp;
+        openRequest[roundId] = intakeId;
         emit Requested(roundId, intakeId, price);
     }
 
@@ -220,8 +262,7 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         if (pendingSince[intakeId] == 0 || block.timestamp < pendingSince[intakeId] + REQUEST_TIMEOUT) {
             revert RequestNotStale();
         }
-        delete pendingRound[intakeId];
-        delete pendingSince[intakeId];
+        _forget(intakeId);
         emit RequestCleared(intakeId);
     }
 
@@ -234,16 +275,28 @@ contract OracleAdapter is OracleAttestationConsumer, TwoStepOwned {
         if (msg.sender != address(intake)) revert NotTheIntake();
         if (pendingSince[intakeId] == 0) revert UnknownRequest();
         uint256 roundId = pendingRound[intakeId];
-        delete pendingRound[intakeId];
-        delete pendingSince[intakeId];
+        _forget(intakeId);
         _accept(roundId, a, signature);
     }
 
-    /// @notice Manual relay: anyone may submit the oracle's signed attestation for a round.
+    /// @notice Manual relay. Anyone may relay the answer to a request this contract made for the round
+    /// (`a.requestId` registered by `request()`); any other attestation only the executor or the owner.
     function submitAttestation(uint256 roundId, OracleAttestation.Attestation calldata a, bytes calldata signature)
         external
     {
+        if (pendingSince[a.requestId] != 0 && pendingRound[a.requestId] == roundId) {
+            _forget(a.requestId);
+        } else if (msg.sender != executor && msg.sender != owner()) {
+            revert NotRelayer();
+        }
         _accept(roundId, a, signature);
+    }
+
+    function _forget(bytes32 intakeId) internal {
+        uint256 roundId = pendingRound[intakeId];
+        if (openRequest[roundId] == intakeId) delete openRequest[roundId];
+        delete pendingRound[intakeId];
+        delete pendingSince[intakeId];
     }
 
     function _accept(uint256 roundId, OracleAttestation.Attestation calldata a, bytes calldata signature) internal {

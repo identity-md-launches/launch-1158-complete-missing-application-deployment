@@ -9,6 +9,12 @@ Budget-limited driver for the IdentityMD paid flows the project uses:
   * ``job.open``        - opens an agent job that proposes challenge content or artwork. Its output
                           is a *proposal file* for the owner to read. It never changes an active
                           round, never signs anything and never touches player funds.
+  * ``buy-prio`` / ``buy-imd`` - the treasury's bounded purchases (``FeeTreasury.buyPrio`` /
+                          ``buyImd``). Every purchase is simulated first with ``cast call``; when the
+                          pool answers ``PriceLimitAlreadyExceeded`` (no liquidity left on the buy
+                          side) the operator records a backoff and refuses to broadcast until it has
+                          expired, instead of paying gas for a swap that cannot fill. The backoff
+                          doubles on every consecutive refusal and resets on the first success.
 
 Everything is capped by ``operator.json``: a spend ceiling per UTC day in IMD and in gas ETH, a
 maximum number of requests per day, and a hard switch ``paid_operations_enabled`` that stays off
@@ -57,6 +63,12 @@ DEFAULT_CONFIG = {
     },
     "poll": {"interval_seconds": 30, "max_attempts": 120},
     "retries": {"attempts": 3, "backoff_seconds": 5},
+    "purchases": {
+        "eth_per_buy": "100000000000000000",
+        "min_out_bps_of_floor": 10000,
+        "price_limit_backoff_seconds": 3600,
+        "price_limit_backoff_max_seconds": 86400,
+    },
     "state_file": "operator-state.json",
     "proposals_dir": "proposals",
 }
@@ -141,6 +153,91 @@ def require_enabled(cfg: dict[str, Any]) -> None:
         raise SystemExit("paid operations are disabled: configure the OracleAdapter, fund IMD from fees, then enable")
     if not cfg["contracts"].get("oracle_adapter"):
         raise SystemExit("contracts.oracle_adapter is not set")
+
+
+# ----------------------------------------------------------------------------- purchases
+
+# Uniswap v4 PoolManager / Pool errors a treasury purchase can surface. The first is the "no liquidity in
+# the direction of the swap at this price" case the brief names: back off, do not retry on a timer.
+PRICE_LIMIT_ALREADY_EXCEEDED = "PriceLimitAlreadyExceeded"
+PRICE_LIMIT_SELECTOR = "0x7c9c6e8f"  # bytes4(keccak256("PriceLimitAlreadyExceeded(uint160,uint160)"))
+
+
+class Backoff:
+    """Persistent per-purchase backoff. ``blocked_until`` is a UTC timestamp; ``streak`` doubles the wait."""
+
+    def __init__(self, cfg: dict[str, Any], state_path: Path):
+        self.cfg = cfg["purchases"]
+        self.state_path = state_path
+        self.state: dict[str, Any] = {}
+        if state_path.exists():
+            self.state = json.loads(state_path.read_text())
+
+    def blocked(self, kind: str, now: float) -> tuple[bool, int]:
+        until = int(self.state.get(kind, {}).get("blocked_until", 0))
+        return now < until, until
+
+    def hit(self, kind: str, now: float) -> int:
+        entry = self.state.get(kind, {"streak": 0})
+        streak = int(entry.get("streak", 0)) + 1
+        wait = min(
+            int(self.cfg["price_limit_backoff_seconds"]) * (2 ** (streak - 1)),
+            int(self.cfg["price_limit_backoff_max_seconds"]),
+        )
+        self.state[kind] = {"streak": streak, "blocked_until": int(now) + wait, "last_reason": PRICE_LIMIT_ALREADY_EXCEEDED}
+        self.save()
+        return wait
+
+    def clear(self, kind: str) -> None:
+        if kind in self.state:
+            del self.state[kind]
+            self.save()
+
+    def save(self) -> None:
+        self.state_path.write_text(json.dumps(self.state, indent=2))
+
+
+def is_price_limit_revert(text: str) -> bool:
+    t = text or ""
+    return PRICE_LIMIT_ALREADY_EXCEEDED in t or PRICE_LIMIT_SELECTOR in t.lower()
+
+
+def cmd_buy(cfg: dict[str, Any], budget: Budget, backoff: Backoff, kind: str, dry_run: bool, now=time.time, caller=None) -> dict:
+    """``FeeTreasury.buyPrio`` / ``buyImd`` from the operator (executor) wallet, simulate-first.
+
+    The contract itself bounds the spend (maxSpendPerSwap, spendPerWindow, price floors); this adds the
+    operator's daily gas ledger and the PriceLimitAlreadyExceeded backoff. Nothing is sent when the
+    simulation fails for any reason; only the price-limit case arms the backoff, because it means the pool
+    has no liquidity to sell into right now and retrying on a timer would only burn gas.
+    """
+    require_enabled(cfg)
+    treasury = cfg["contracts"].get("fee_treasury")
+    if not treasury:
+        raise SystemExit("contracts.fee_treasury is not set")
+    fn = "buyPrio(uint256,uint256)" if kind == "prio" else "buyImd(uint256,uint256)"
+    eth_in = str(int(cfg["purchases"]["eth_per_buy"]))
+    is_blocked, until = backoff.blocked(kind, now())
+    if is_blocked:
+        return {"ok": False, "reason": f"backing off after {PRICE_LIMIT_ALREADY_EXCEEDED} until {until}", "blocked_until": until}
+    ok, why = budget.allow(gas_wei=int(4e15))
+    if not ok:
+        return {"ok": False, "reason": why}
+    run = caller or cast
+    executor = cfg.get("executor_address", "")
+    sim_args = [treasury, fn, eth_in, "0"] + (["--from", executor] if executor else [])
+    try:
+        run(sim_args, cfg, dry_run=dry_run)
+    except subprocess.CalledProcessError as exc:
+        text = (exc.stderr or "") + (exc.stdout or "")
+        if is_price_limit_revert(text):
+            wait = backoff.hit(kind, now())
+            return {"ok": False, "reason": f"{PRICE_LIMIT_ALREADY_EXCEEDED}: pool has no liquidity for this buy; backing off {wait}s", "backoff_seconds": wait}
+        return {"ok": False, "reason": "simulation reverted; nothing sent", "detail": text.strip()[-400:]}
+    tx = run([treasury, fn, eth_in, "0"], cfg, send=True, dry_run=dry_run)
+    if not dry_run:
+        budget.record(gas_wei=int(4e15))
+    backoff.clear(kind)
+    return {"ok": True, "tx": tx}
 
 
 # ----------------------------------------------------------------------------- commands
@@ -269,12 +366,17 @@ def main(argv: list[str] | None = None) -> int:
     rl.add_argument("attestation_file")
     pr = sub.add_parser("propose")
     pr.add_argument("brief")
+    sub.add_parser("buy-prio")
+    sub.add_parser("buy-imd")
     a = ap.parse_args(argv)
 
     cfg = load_config(Path(a.config))
     http = Http(cfg["api_base"], int(cfg["retries"]["attempts"]), float(cfg["retries"]["backoff_seconds"]))
     budget = Budget(cfg, Path(cfg["state_file"]))
-    if a.cmd == "capabilities":
+    backoff = Backoff(cfg, Path(cfg["state_file"]).with_name("operator-backoff.json"))
+    if a.cmd in ("buy-prio", "buy-imd"):
+        out = cmd_buy(cfg, budget, backoff, "prio" if a.cmd == "buy-prio" else "imd", a.dry_run)
+    elif a.cmd == "capabilities":
         out = cmd_capabilities(cfg, http)
     elif a.cmd == "quote":
         out = cmd_quote(cfg, http, a.action, json.loads(a.body_json))

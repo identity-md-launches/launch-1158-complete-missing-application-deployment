@@ -144,6 +144,9 @@ contract FeeTreasuryEdgeTest is Fixture {
         treasury.withdrawOwner(bad, budget);
         assertEq(treasury.ownerBudget(), budget);
         vm.prank(executor);
+        vm.expectRevert(FeeTreasury.WrongDestination.selector);
+        treasury.withdrawReserve(bad, 1);
+        vm.prank(owner);
         vm.expectRevert(FeeTreasury.TransferFailed.selector);
         treasury.withdrawReserve(bad, 1);
         bucketsEqualBalance();
@@ -171,8 +174,9 @@ contract FeeTreasuryEdgeTest is Fixture {
         vm.prank(owner);
         treasury.withdrawOwner(sink, 0);
         vm.prank(executor);
-        treasury.withdrawReserve(sink, 0);
+        treasury.withdrawReserve(payable(executor), 0);
         assertEq(sink.balance, 0);
+        assertEq(executor.balance, 0);
     }
 
     // ------------------------------------------------------------------ purchases
@@ -427,13 +431,25 @@ contract FeeTreasuryEdgeTest is Fixture {
         vm.expectRevert();
         treasury.setMaxSpendPerSwap(1);
         vm.stopPrank();
+        // Before any income or purchase the bindings are correctable (finding 0cd78a87)...
+        vm.startPrank(owner);
+        treasury.bindHook(trader);
+        treasury.bindHook(address(hook));
+        treasury.setPrio(trader);
+        treasury.setPrio(address(token));
+        vm.expectRevert(FeeTreasury.ZeroAddress.selector);
+        treasury.setImd(address(0));
+        vm.stopPrank();
+        // ...and frozen once a fee has arrived (hook) and a purchase has happened (PRIO).
+        earn(100 ether);
+        treasury.allocate();
+        vm.prank(executor);
+        treasury.buyPrio(0.1 ether, 0);
         vm.startPrank(owner);
         vm.expectRevert(FeeTreasury.HookAlreadyBound.selector);
         treasury.bindHook(trader);
         vm.expectRevert(FeeTreasury.AlreadySet.selector);
         treasury.setPrio(trader);
-        vm.expectRevert(FeeTreasury.ZeroAddress.selector);
-        treasury.setImd(address(0));
         vm.stopPrank();
         FeeTreasury fresh = new FeeTreasury(manager, owner);
         vm.startPrank(owner);

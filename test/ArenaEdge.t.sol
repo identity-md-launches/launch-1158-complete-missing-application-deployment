@@ -88,6 +88,7 @@ contract ArenaEdgeTest is Test {
             expiresAt: uint64(block.timestamp + 1 days)
         });
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_KEY, adapter.attestationDigest(a));
+        vm.prank(owner);
         adapter.submitAttestation(id, a, abi.encodePacked(r, s, v));
     }
 
@@ -309,6 +310,7 @@ contract ArenaEdgeTest is Test {
             });
             (uint8 v, bytes32 rr, bytes32 s) = vm.sign(SIGNER_KEY, adapter.attestationDigest(a));
             vm.expectRevert(abi.encodeWithSelector(OracleAdapter.IssuedTooEarly.selector, early, r.commitDeadline));
+            vm.prank(owner);
             adapter.submitAttestation(id, a, abi.encodePacked(rr, s, v));
         }
         // Exactly at the boundary: accepted by both.
